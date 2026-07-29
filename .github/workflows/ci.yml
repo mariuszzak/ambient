@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: "1.15"
+            otp: "25"
+          - elixir: "1.17"
+            otp: "27"
+          - elixir: "1.18"
+            otp: "27"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
+      - run: mix deps.get
+      - run: mix format --check-formatted
+      - run: mix deps.unlock --check-unused
+      - run: mix compile --warnings-as-errors
+      # The disabled-overrides build must stay warning-free for consumers who
+      # compile their releases with --warnings-as-errors. Compiling Ambient
+      # alone isn't enough: the warnings that matter (a `fetch/2` inferred as a
+      # constant makes callers' `{:ok, _}` branches unreachable) land in the
+      # consumer's modules, so build it as a dependency of a real project too.
+      - run: MIX_ENV=prod mix compile --warnings-as-errors
+      - name: Compile as a dependency (both envs)
+        working-directory: test/fixtures/consumer
+        run: |
+          mix deps.get
+          MIX_ENV=test mix compile --warnings-as-errors
+          MIX_ENV=prod mix compile --warnings-as-errors
+      # The generated Ambient.Value writers' success typings land in the *consumer's*
+      # modules, so only a real consuming app can catch a regression here.
+      - name: Dialyzer as a dependency
+        working-directory: test/fixtures/consumer
+        run: MIX_ENV=dev mix dialyzer
+      # Hard-coding the flag on is the one way a consumer defeats the switch,
+      # so the warning that catches it must actually fire.
+      - name: Warn when a prod build hard-codes the flag on
+        working-directory: test/fixtures/consumer
+        run: |
+          printf 'import Config\nconfig :ambient, enable_overrides: true\n' > config/config.exs
+          MIX_ENV=prod mix compile --force 2>&1 | tee /tmp/hardcoded.log
+          git checkout -- config/config.exs
+          grep -q "carries the override machinery" /tmp/hardcoded.log
+      - run: mix credo --strict
+      - run: mix test --cover

@@ -1,0 +1,19 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/.fetch
+erl_crash.dump
+*.ez
+ambient-*.tar
+/tmp/
+.elixir_ls/
+/.elixir-tools/
+
+# Local working notes — not shipped.
+/CLAUDE.md
+
+# Scratch build artefacts of the consumer fixture (see .github/workflows/ci.yml).
+/test/fixtures/consumer/_build/
+/test/fixtures/consumer/deps/
+/test/fixtures/consumer/priv/plts/
