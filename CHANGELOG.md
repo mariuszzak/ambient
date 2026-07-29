@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-07-29
+
+### Fixed
+- **Every `Ambient.Random` read crashed when `Ambient.start_servers/1` hadn't
+  been called**, in any build with overrides enabled. `uniform/1`, `bytes/1`,
+  `shuffle/1` and friends route through
+  `Ambient.ProcessOverride.get_and_update/3`, which reached `shared_owner/1` –
+  a bare `:ets.lookup` – before checking the table existed, so ETS raised
+  `ArgumentError` ("the table identifier does not refer to an existing ETS
+  table") where a read should simply miss and fall through to `:rand`.
+
+  It bit hardest in `:dev`, which the recommended
+  `enable_overrides: config_env() != :prod` leaves enabled while nothing
+  starts the servers: `iex -S mix` plus any `Ambient.Random` call crashed.
+  `Ambient.Clock` and `Ambient.Config` were unaffected – they read through
+  `fetch/2`, which has always guarded.
+
+  No table now means no override, so `get_and_update/3` returns `:error` and
+  the caller falls through. Writers are unchanged and still raise
+  `Ambient.Error` with `:server_not_started`, which is the actionable message
+  for the case that really is a mistake.
+
 ## [0.1.0] - 2026-07-29
 
 First release.
@@ -149,4 +171,5 @@ Also:
   state rather than a fresh one per call, so a caller who seeded `:rand`
   directly will see those draws follow that seed.
 
+[0.1.1]: https://github.com/mariuszzak/ambient/releases/tag/v0.1.1
 [0.1.0]: https://github.com/mariuszzak/ambient/releases/tag/v0.1.0

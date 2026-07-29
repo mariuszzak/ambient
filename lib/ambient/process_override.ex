@@ -268,17 +268,22 @@ defmodule Ambient.ProcessOverride do
     @spec get_and_update(table(), key(), (value() -> {result, value()})) :: {:ok, result} | :error
           when result: term()
     def get_and_update(table, key, fun) do
-      case shared_owner(table) do
-        nil ->
+      # The existence check has to come first: `shared_owner/1` is a bare
+      # `:ets.lookup`, so on an unstarted table it raised where a read should
+      # simply miss. No table means no override, which means nothing to update.
+      cond do
+        not table_exists?(table) ->
+          :error
+
+        owner = shared_owner(table) ->
+          GenServer.call(server_name(table), {:get_and_update, owner, key, fun})
+
+        true ->
           with {:ok, current} <- fetch(table, key) do
             {value, updated} = fun.(current)
             put(table, key, updated)
             {:ok, value}
           end
-
-        owner ->
-          ensure_started!(table)
-          GenServer.call(server_name(table), {:get_and_update, owner, key, fun})
       end
     end
 
@@ -413,6 +418,9 @@ defmodule Ambient.ProcessOverride do
     end
   end
 
+  # Callers must have established that `table` exists – this is a bare lookup
+  # and raises on a missing table. `fetch/2`, `mode/1` and `get_and_update/3`
+  # check first; the writers get there via `ensure_started!/1`.
   defp shared_owner(table) do
     case :ets.lookup(table, :mode) do
       [{:mode, {:shared, owner}}] -> owner

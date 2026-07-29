@@ -60,6 +60,15 @@ defmodule Ambient.ProcessOverrideTest do
       assert PO.delete(:ambient_nonexistent_table, :k) == :ok
     end
 
+    test "get_and_update/3 misses instead of raising" do
+      # Regression: get_and_update/3 reached shared_owner/1 – a bare
+      # :ets.lookup – before any existence check, so it raised ArgumentError
+      # from ETS. Every Ambient.Random *read* goes through here, so forgetting
+      # start_servers/1 crashed uniform/bytes/shuffle instead of letting them
+      # fall through to :rand.
+      assert PO.get_and_update(:ambient_nonexistent_table, :k, fn s -> {s, s} end) == :error
+    end
+
     test "put raises a structured error when the server isn't started" do
       error = assert_raise Ambient.Error, fn -> PO.put(:ambient_unstarted_table, :k, :v) end
       assert error.reason == :server_not_started
