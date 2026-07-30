@@ -89,7 +89,7 @@ First release.
   advanced state back, and shared mode forbids non-owner writes, so any process
   that wasn't the shared owner raised `{:not_shared_owner, pid}` – i.e. exactly
   the processes shared mode exists to reach. Writes now route through
-  `put_resolved/3`, giving one globally advancing stream.
+  `get_and_update/3`, giving one globally advancing stream.
 - **`allow/3` and `set_shared/2` monitored by cast, then inserted from the
   client**, so a pid dying in the gap left a row no `:DOWN` would ever clean.
   Measured over 40k attempts: 202 orphaned `allow` rows (which pid reuse then

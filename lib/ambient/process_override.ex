@@ -88,6 +88,24 @@ defmodule Ambient.ProcessOverride do
 
   Check the current build with `enabled?/0`.
 
+  ## Dialyzer
+
+  Gate the flag on `config_env() != :prod`, not `== :test`. In a build without
+  overrides the writers raise, so their success typing is `none()` – and
+  `dialyxir` runs in `:dev` by default, which is exactly the build `== :test`
+  leaves without overrides. Ambient's own generated specs say `no_return()`
+  there, so the library stays clean either way, but a function of *yours* that
+  wraps a writer still can't return:
+
+      def put(tenant), do: put_override(:tenant, tenant)
+      # warning: Function put/1 has no local return
+
+  Measured on a small consuming app with one `use Ambient.Config` and one
+  `use Ambient.Value`: zero warnings under `!= :prod`, one under `== :test`.
+  If you'd rather keep `== :test`, move such wrappers behind
+  `if Ambient.ProcessOverride.enabled?()`, which compiles them out of the build
+  that couldn't run them anyway.
+
   ## API
 
   All functions take the ETS table atom – each consumer module owns the naming
