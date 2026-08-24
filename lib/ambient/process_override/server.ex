@@ -87,9 +87,23 @@ defmodule Ambient.ProcessOverride.Server do
   def handle_call({:get_and_update, owner, key, fun}, _from, state) do
     case :ets.lookup(state.table, {owner, key}) do
       [{_, current}] ->
-        {value, updated} = fun.(current)
-        :ets.insert(state.table, {{owner, key}, updated})
-        {:reply, {:ok, value}, state}
+        # `fun` is the caller's code, running on the Server's side of the
+        # mailbox. Letting it escape would kill the table owner – dropping the
+        # ETS table and silently voiding every override in flight, for every
+        # process, mid-suite. Same reasoning as the catch-alls above, except
+        # here the crash is *expected* input: a wrong-shaped return or a raise
+        # inside a `get_and_update/3` callback is an ordinary user bug.
+        #
+        # Ship the exception back and re-raise it in the caller instead, so it
+        # looks exactly like the private-mode path, which runs client-side.
+        try do
+          {value, updated} = fun.(current)
+          :ets.insert(state.table, {{owner, key}, updated})
+          {:reply, {:ok, value}, state}
+        catch
+          kind, reason ->
+            {:reply, {:ambient_raise, kind, reason, __STACKTRACE__}, state}
+        end
 
       [] ->
         {:reply, :error, state}

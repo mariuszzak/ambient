@@ -251,6 +251,30 @@ defmodule Ambient.SharedModeTest do
       assert length(Enum.uniq(draws)) == 200
     end
 
+    test "a raising fun surfaces in the caller and leaves the table intact" do
+      # Regression: `fun` runs on the Server's side of the mailbox, so an
+      # exception inside it killed the table owner. The caller saw an :exit
+      # rather than its own error, and the restart handed back an *empty*
+      # table – silently voiding every override in flight, suite-wide.
+      PO.put(@table, :n, 1)
+      PO.set_shared(@table)
+      tid = :ets.whereis(@table)
+
+      assert_raise RuntimeError, "boom", fn ->
+        PO.get_and_update(@table, :n, fn _ -> raise "boom" end)
+      end
+
+      # Same for a callback that simply returns the wrong shape.
+      assert_raise MatchError, fn ->
+        PO.get_and_update(@table, :n, fn n -> n end)
+      end
+
+      assert :ets.whereis(@table) == tid, "the table was dropped and rebuilt"
+      assert PO.mode(@table) == {:shared, self()}
+      assert PO.fetch(@table, :n) == {:ok, 1}
+      assert PO.get_and_update(@table, :n, &{&1, &1 + 1}) == {:ok, 1}
+    end
+
     test "the shared stream advances globally rather than forking per process" do
       Ambient.start_servers([Ambient.Random])
       Ambient.Random.seed(7)

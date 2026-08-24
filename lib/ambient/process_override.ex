@@ -279,9 +279,15 @@ defmodule Ambient.ProcessOverride do
     `Server`, which serialises it. Private mode stays client-side, since a
     process can't race itself.
 
+    If `fun` raises (or returns something other than a two-tuple), the
+    exception surfaces in the *caller*, with the caller's stacktrace, in both
+    modes. In shared mode it is caught inside the `Server` and re-raised here:
+    letting it escape there would take the table owner down with it and void
+    every override in the table.
+
     Note what this does *not* buy: which concurrent caller gets which value
     still depends on scheduling. One advancing stream and reproducible ordering
-    are mutually exclusive under concurrency – see `Ambient.Random`.
+    are mutually exclusive under concurrency.
     """
     @spec get_and_update(table(), key(), (value() -> {result, value()})) :: {:ok, result} | :error
           when result: term()
@@ -294,7 +300,16 @@ defmodule Ambient.ProcessOverride do
           :error
 
         owner = shared_owner(table) ->
-          GenServer.call(server_name(table), {:get_and_update, owner, key, fun})
+          case GenServer.call(server_name(table), {:get_and_update, owner, key, fun}) do
+            # `fun` raised inside the Server. It caught it rather than dying
+            # with the table; re-raise here so the caller sees its own
+            # exception with its own stacktrace, exactly as in private mode.
+            {:ambient_raise, kind, reason, stacktrace} ->
+              :erlang.raise(kind, reason, stacktrace)
+
+            result ->
+              result
+          end
 
         true ->
           with {:ok, current} <- fetch(table, key) do
