@@ -176,7 +176,9 @@ defmodule Ambient.Config do
   end
 
   @doc false
-  @spec __normalize__(key()) :: atom() | [atom(), ...]
+  # Takes `[atom()]` rather than `key()`: an empty path is a caller error, and
+  # this is where it's rejected, so the argument type has to admit it.
+  @spec __normalize__(atom() | [atom()]) :: atom() | [atom(), ...]
   def __normalize__([key]), do: key
   def __normalize__([_ | _] = path), do: path
 

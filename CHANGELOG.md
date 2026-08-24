@@ -4,6 +4,74 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-24
+
+Ambient shipped four built-in values. Two of them – `Ambient.Env` and
+`Ambient.Random` – turned out not to earn their surface, and the flagship one
+couldn't express the way real config is written. This release cuts the first
+two, fixes the third, and repositions the library around what it is actually
+for: a per-process `Application.get_env` layer, plus `Ambient.Value` for
+ambient values of your own.
+
+### Removed
+- **BREAKING: `Ambient.Env` and `Ambient.Credo.NoDirectEnv`.** An override can
+  only affect a read that happens at runtime, and idiomatic Elixir reads env
+  vars in `config/runtime.exs` – before any override can exist – then puts them
+  into app config. `Ambient.Env`'s own moduledoc said so and the README pointed
+  readers at `Ambient.Config` instead. Use `Ambient.Config`; for a read that
+  genuinely happens at runtime, `use Ambient.Value` wraps `System.get_env/2` in
+  about ten lines.
+- **BREAKING: `Ambient.Random` and `Ambient.Credo.NoDirectRandom`.** It cost a
+  fork-vs-shared-stream semantics table, a crypto contract, and a "seedable in
+  tests, `:crypto.strong_rand_bytes/1` in production" pitch guarding a function
+  with no production callers – the real credential sites in the app this was
+  built for all call `:crypto.strong_rand_bytes/1` directly, which is the right
+  answer. `use Ambient.Value` rebuilds a seeded RNG in about ten lines; the
+  README shows how, including the `get_and_update/3` shape it needs. The
+  machinery it leaned on – `get_and_update/3` and shared-mode atomicity – stays,
+  and serves any read-modify-write value.
+
+### Added
+- **Nested config keys.** `config :my_app, :oauth, client_id: "…"` reads back as
+  a keyword list, so the call site is
+  `Application.get_env(:my_app, :oauth)[:client_id]` – which the flat accessor
+  could only override wholesale. That is why nested reads never migrated in the
+  app this was built for. `get/2`, `put/2`, `revert/1` and `overridden?/1` now
+  take a path:
+
+      MyApp.Config.get([:oauth, :client_id], "default")
+      MyApp.Config.put([:oauth, :client_id], "test-client")
+
+  Paths step through keyword lists and maps to any depth, and resolve
+  longest-prefix-first, so an existing wholesale `put(:oauth, …)` stays visible
+  to a leaf read. A one-element path is the same key as the bare atom. The
+  disabled build resolves paths straight out of app env with no ETS lookup.
+
+### Fixed
+- **A raising `get_and_update/3` callback took down the table's `Server`.** The
+  callback runs inside the `Server` in shared mode, so an exception in it killed
+  the table owner: the caller saw an `:exit` instead of its own error, and the
+  restart handed back an *empty* ETS table, silently voiding every override in
+  flight for every process. The exception is now caught, shipped back, and
+  re-raised in the caller, so it behaves exactly like the private-mode path.
+- **An `allow` cycle discarded a valid `$callers` answer.** Hitting an
+  already-visited pid returned `nil` from the whole resolution rather than
+  falling through to the caller chain, so a cycle anywhere in the grants could
+  hide an override an ancestor really owned.
+- **`Ambient.Credo.NoDirectConfig` missed `Application.get_env(@otp_app, :key)`.**
+  It matched the app argument as a literal atom, so one of the commonest
+  spellings of the banned call was invisible to it. Module attributes are now
+  flagged. This matters because "Credo pins it" is the whole answer to Ambient
+  asking you to change every read site.
+
+### Changed
+- The package description and README are rebuilt around `Ambient.Config` and
+  `use Ambient.Value`, with `Ambient.Clock` as the worked example. The
+  comparison section is a third of its former length, and a new "What it costs
+  to adopt" section states plainly what the migration does not reach.
+- The Credo checks' alias/`apply` blind spot is now documented rather than
+  implied away.
+
 ## [0.1.1] - 2026-07-29
 
 ### Fixed
