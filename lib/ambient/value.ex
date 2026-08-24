@@ -3,11 +3,10 @@ defmodule Ambient.Value do
   Build your own overridable value on top of `Ambient.ProcessOverride`.
 
   An *ambient value* is one resolved implicitly from the surrounding context
-  rather than threaded through arguments. `Ambient.Config`, `Ambient.Clock`,
-  `Ambient.Random` and `Ambient.Env` are all built on this module – nothing
-  about them is privileged. If your app has an ambient value of its own (the
-  current tenant, the acting user, a request id), this is the supported way to
-  make it as testable as the built-in ones.
+  rather than threaded through arguments. `Ambient.Config` and `Ambient.Clock`
+  are both built on this module – nothing about them is privileged. If your app
+  has an ambient value of its own (the current tenant, the acting user, a
+  request id), this is the supported way to make it as testable as they are.
 
       defmodule MyApp.Tenant do
         use Ambient.Value, table: :my_app_tenant_overrides
@@ -80,10 +79,9 @@ defmodule Ambient.Value do
 
       @ambient_table unquote(table)
 
-      # Exposed so a module can compile out a branch of its own, the way
-      # `Ambient.Env.get/2` drops its "overridden as unset" clause. Use it in
-      # the module body – it is a compile-time constant, so a runtime `if` on
-      # it is just dead code.
+      # Exposed so a module can compile out a branch of its own – a clause that
+      # would be provably dead in a disabled build. Use it in the module body:
+      # it is a compile-time constant, so a runtime `if` on it is just dead code.
       @ambient_enabled unquote(@enabled)
 
       @doc false

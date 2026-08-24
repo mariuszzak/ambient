@@ -10,12 +10,10 @@ defmodule Ambient do
 
   ## Built-in values
 
-    * `Ambient.Clock`  – an overridable wall clock (freeze / travel time)
-    * `Ambient.Random` – a seedable, replayable random number generator
-    * `Ambient.Env`    – overridable OS environment variables
     * `Ambient.Config` – an app-config accessor with a per-process override layer
+    * `Ambient.Clock`  – an overridable wall clock (freeze / travel time)
 
-  All four sit on `Ambient.ProcessOverride`, the shared engine (ETS +
+  Both sit on `Ambient.ProcessOverride`, the shared engine (ETS +
   `$callers` inheritance + an Ecto-Sandbox-style `allow/3`), and are assembled
   with `Ambient.Value` – which you can `use` to build overridable values of
   your own.
@@ -38,13 +36,12 @@ defmodule Ambient do
   Then start one override server per table before the suite runs, in
   `test/test_helper.exs`:
 
-      Ambient.start_servers([Ambient.Clock, Ambient.Random, Ambient.Env, MyApp.Config])
+      Ambient.start_servers([MyApp.Config, Ambient.Clock])
       ExUnit.start()
 
   In production the flag is `false` and the override branches aren't compiled
-  at all: each wrapper *is* the function it wraps – `DateTime.utc_now/0`,
-  `:rand.uniform/1`, `:crypto.strong_rand_bytes/1`, `System.get_env/2`,
-  `Application.get_env/3` – with no lookup and no branch. See
+  at all: each wrapper *is* the function it wraps – `Application.get_env/3`,
+  `DateTime.utc_now/0` – with no lookup and no branch. See
   `Ambient.ProcessOverride` for what that guarantees.
   """
 
@@ -61,7 +58,7 @@ defmodule Ambient do
   Start one override `Server` per given table.
 
   Accepts one value module or a list of them: `Ambient.Clock`,
-  `Ambient.Random`, a module that `use`s `Ambient.Config` or `Ambient.Value`, a
+  `Ambient.Clock`, a module that `use`s `Ambient.Config` or `Ambient.Value`, a
   `use Ambient.Facade` wrapper of one – anything exporting `__ambient_table__/0` –
   or raw table atoms. Idempotent: a table whose server is already running is
   skipped.

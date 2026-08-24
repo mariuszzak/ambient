@@ -8,8 +8,6 @@ end
 
 Ambient.start_servers([
   Ambient.Clock,
-  Ambient.Random,
-  Ambient.Env,
   Ambient.TestConfig,
   :ambient_core_test
 ])

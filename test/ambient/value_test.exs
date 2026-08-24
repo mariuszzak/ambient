@@ -81,7 +81,7 @@ defmodule Ambient.ValueTest do
   end
 
   test "a read-modify-write read falls through when the server isn't started" do
-    # The Ambient.Random shape: reads that advance state must degrade to their
+    # The seeded-RNG shape: reads that advance state must degrade to their
     # fallback, not crash, when nobody called start_servers/1.
     defmodule Counter do
       use Ambient.Value, table: :ambient_value_test_never_started

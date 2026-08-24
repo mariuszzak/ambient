@@ -1,9 +1,8 @@
 defmodule Ambient.ProcessOverride do
   @moduledoc """
   ETS-backed process-local override store with cross-process inheritance –
-  the shared engine behind `Ambient.Clock`, `Ambient.Random`, `Ambient.Env`
-  and `Ambient.Config`, and behind any value module you build with
-  `Ambient.Value`.
+  the shared engine behind `Ambient.Clock` and `Ambient.Config`, and behind
+  any value module you build with `Ambient.Value`.
 
   ## Why
 
@@ -64,8 +63,8 @@ defmodule Ambient.ProcessOverride do
   It defaults to **`false`**. In a build that didn't opt in, no *Ambient* API
   can produce an override: `put/3` and `allow/3` raise; `Ambient.start_servers/1`,
   `Server.start_link/1` and `Server.init/1` refuse to create the ETS table; and
-  `Ambient.Random`'s seeded code paths aren't compiled at all. No seeds script,
-  remote console, `$callers` chain or `allow/3` grant re-opens them.
+  `Ambient.Value`'s `get_or/2` compiles its lookup away entirely. No seeds
+  script, remote console, `$callers` chain or `allow/3` grant re-opens them.
 
   What it is *not*: `fetch/2` keeps its ETS lookup in disabled builds (see its
   docs for why), so code that hand-rolls `:ets.new(:ambient_clock_overrides,
@@ -73,10 +72,8 @@ defmodule Ambient.ProcessOverride do
   through `fetch/2` directly – including `mode/1` and the built-ins'
   `overridden?/1`. It is **not** visible to the built-ins' actual reads:
   `Ambient.Value`'s `get_or/2` compiles the lookup away, so `Clock.utc_now/0`
-  and a generated config `get/2` ignore such a row entirely. Forging one takes arbitrary
-  code execution inside the node anyway.
-  That is what makes `bytes/1` safe for credential material in production
-  while staying deterministic under `Ambient.Random.seed/1` in tests.
+  and a generated config `get/2` ignore such a row entirely. Forging one takes
+  arbitrary code execution inside the node anyway.
 
   Two more properties worth knowing:
 
@@ -124,8 +121,8 @@ defmodule Ambient.ProcessOverride do
   @enabled Application.compile_env(:ambient, :enable_overrides, false)
 
   # The one way a consumer defeats the switch is hard-coding it on, which puts
-  # the machinery in the release and makes `Random.bytes/1` downgradeable
-  # again. Warn while compiling into a prod build.
+  # the machinery in the release, where a stray override can reach real traffic.
+  # Warn while compiling into a prod build.
   #
   # Not `Mix.env/0`: Mix compiles dependencies with `env: :prod` by default, so
   # inside a dep it always reads `:prod`, even for a consumer's test build.
@@ -139,9 +136,9 @@ defmodule Ambient.ProcessOverride do
           Path.basename(Mix.Project.build_path()) == "prod") do
     IO.warn(
       "Ambient was compiled into a :prod build with `enable_overrides: true`. " <>
-        "That build carries the override machinery, so Ambient.Random.bytes/1 " <>
-        "can be downgraded to a seeded stream by any ambient seed. Derive the " <>
-        "flag from the env: `config :ambient, enable_overrides: config_env() != :prod`.",
+        "That build carries the override machinery, so a stray seed or allow/3 " <>
+        "grant can reach real traffic. Derive the flag from the env: " <>
+        "`config :ambient, enable_overrides: config_env() != :prod`.",
       []
     )
   end
@@ -226,8 +223,8 @@ defmodule Ambient.ProcessOverride do
     While shared, only `owner_pid` may write to the table (`put/3` from anyone
     else raises `{:not_shared_owner, pid}`) and `allow/3` is refused – every
     process already reads the owner's values, so there is nothing to grant.
-    `get_and_update/3` is the exception, so read-modify-write modules like
-    `Ambient.Random` keep working – atomically – from every process.
+    `get_and_update/3` is the exception, so read-modify-write values keep
+    working – atomically – from every process.
 
     Handing over to a different owner is the current owner's call: once shared,
     `set_shared/2` from anyone else raises `{:not_shared_owner, pid}` rather
@@ -267,8 +264,8 @@ defmodule Ambient.ProcessOverride do
     result. Returns `{:ok, value}` where `value` is `fun`'s first element, or
     `:error` if no override is in scope.
 
-    For values whose reads *write*: `Ambient.Random` advances its seed state on
-    every draw. A plain `fetch/2` then `put/3` is fine in private mode, where
+    For values whose reads *write*: a seeded RNG advances its state on every
+    draw. A plain `fetch/2` then `put/3` is fine in private mode, where
     each process owns its own row, but in shared mode every process is reading
     and writing the *same* row – so two concurrent draws read the same state,
     compute the same number and overwrite each other. Measured before this

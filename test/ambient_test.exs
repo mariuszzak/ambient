@@ -12,7 +12,7 @@ defmodule AmbientTest do
     end
 
     test "accepts a value module (already started in test_helper)" do
-      assert :ok = Ambient.start_servers([Ambient.Clock, Ambient.Random])
+      assert :ok = Ambient.start_servers([Ambient.Clock, Ambient.TestConfig])
     end
 
     test "raises on a module-looking atom that isn't a valid value module" do

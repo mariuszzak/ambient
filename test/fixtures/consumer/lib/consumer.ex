@@ -20,13 +20,11 @@ defmodule Consumer do
   stays warning-free in *consumer* code – not just in Ambient's own.
   """
 
-  def token, do: Ambient.Random.bytes(32) |> Base.url_encode64(padding: false)
-
-  def jittered_backoff(base), do: base + Ambient.Random.uniform(base)
-
   def now, do: Consumer.Clock.utc_now()
 
   def timeout, do: Consumer.Config.get(:timeout, 5_000)
+
+  def oauth_client_id, do: Consumer.Config.get([:oauth, :client_id], "none")
 
   def tenant, do: Consumer.Tenant.current()
 
@@ -34,6 +32,7 @@ defmodule Consumer do
   # code too.
   def override_timeout(ms), do: Consumer.Config.put(:timeout, ms)
   def clear_timeout, do: Consumer.Config.revert(:timeout)
+  def override_client_id(id), do: Consumer.Config.put([:oauth, :client_id], id)
 
   # The pattern that would break if `fetch/2` were compiled down to a constant
   # `:error` in disabled builds: this `{:ok, _}` clause would be unreachable.

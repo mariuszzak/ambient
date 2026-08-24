@@ -3,7 +3,7 @@ if Code.ensure_loaded?(Credo.Check) do
   defmodule Ambient.Credo.MFAScanner do
     @moduledoc false
     # Shared engine for the "route this call through a wrapper" checks
-    # (NoDirectClock / NoDirectEnv / NoDirectRandom, plus the pipe handling in
+    # (NoDirectClock, plus the pipe handling in
     # NoDirectConfig). Scans a source file for banned
     # module/function/arity references in both call (`Mod.fun(...)`) and capture
     # (`&Mod.fun/N`) form, and returns findings the caller turns into issues.

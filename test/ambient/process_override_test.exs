@@ -63,7 +63,7 @@ defmodule Ambient.ProcessOverrideTest do
     test "get_and_update/3 misses instead of raising" do
       # Regression: get_and_update/3 reached shared_owner/1 – a bare
       # :ets.lookup – before any existence check, so it raised ArgumentError
-      # from ETS. Every Ambient.Random *read* goes through here, so forgetting
+      # from ETS. Every read-modify-write draw goes through here, so forgetting
       # start_servers/1 crashed uniform/bytes/shuffle instead of letting them
       # fall through to :rand.
       assert PO.get_and_update(:ambient_nonexistent_table, :k, fn s -> {s, s} end) == :error

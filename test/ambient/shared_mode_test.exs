@@ -4,7 +4,7 @@ defmodule Ambient.SharedModeTest do
   anything else touching it – hence `async: false`, which ExUnit runs only
   after every async module has finished. Most use a dedicated `@table`; the
   cases that exercise `Ambient.set_shared/2` end to end necessarily flip the
-  real `Ambient.Clock` and `Ambient.Random` tables, and restore them in
+  real `Ambient.Clock` and `Ambient.TestCounter` tables, and restore them in
   `on_exit`. Do not make this file `async: true`.
   """
 
@@ -213,42 +213,41 @@ defmodule Ambient.SharedModeTest do
   end
 
   describe "read-modify-write values" do
-    test "Random works from every process under shared mode" do
-      Ambient.start_servers([Ambient.Random])
-      Ambient.Random.seed(42)
-      Ambient.set_shared([Ambient.Random])
-      on_exit(fn -> Ambient.set_private([Ambient.Random]) end)
+    test "a read that writes works from every process under shared mode" do
+      Ambient.start_servers([Ambient.TestCounter])
+      Ambient.TestCounter.start(0)
+      Ambient.set_shared([Ambient.TestCounter])
+      on_exit(fn -> Ambient.set_private([Ambient.TestCounter]) end)
 
       # Regression: the write-back used to be a plain put/3, so every non-owner
-      # draw raised {:not_shared_owner, _} – i.e. the feature was unusable for
-      # the one value module that writes on read.
-      from_task = Task.async(fn -> Ambient.Random.uniform(100) end) |> Task.await()
-      assert from_task in 1..100
-      assert unrelated(fn -> Ambient.Random.uniform(100) end) in 1..100
-      assert byte_size(unrelated(fn -> Ambient.Random.bytes(4) end)) == 4
+      # read raised {:not_shared_owner, _} – i.e. the feature was unusable for
+      # exactly the values that need it.
+      assert Task.async(fn -> Ambient.TestCounter.next() end) |> Task.await() == 0
+      assert unrelated(fn -> Ambient.TestCounter.next() end) == 1
+      assert Ambient.TestCounter.next() == 2
     end
 
-    test "concurrent draws don't lose each other's updates" do
+    test "concurrent reads don't lose each other's updates" do
       # Regression: the write-back was a plain fetch-then-put on a row every
-      # process shares, so two concurrent draws read the same state, computed
-      # the same number and overwrote each other. Measured before the fix:
-      # 99 duplicates in 200 draws.
-      Ambient.start_servers([Ambient.Random])
-      Ambient.Random.seed(7)
-      Ambient.set_shared([Ambient.Random])
-      on_exit(fn -> Ambient.set_private([Ambient.Random]) end)
+      # process shares, so two concurrent reads saw the same state, computed
+      # the same result and overwrote each other. Measured before the fix:
+      # 99 duplicates in 200 reads.
+      Ambient.start_servers([Ambient.TestCounter])
+      Ambient.TestCounter.start(0)
+      Ambient.set_shared([Ambient.TestCounter])
+      on_exit(fn -> Ambient.set_private([Ambient.TestCounter]) end)
 
       draws =
         1..200
         |> Enum.map(fn _ ->
           Task.async(fn ->
             Process.sleep(0)
-            Ambient.Random.uniform(1_000_000_000)
+            Ambient.TestCounter.next()
           end)
         end)
         |> Task.await_many(:infinity)
 
-      assert length(Enum.uniq(draws)) == 200
+      assert Enum.sort(draws) == Enum.to_list(0..199)
     end
 
     test "a raising fun surfaces in the caller and leaves the table intact" do
@@ -275,14 +274,14 @@ defmodule Ambient.SharedModeTest do
       assert PO.get_and_update(@table, :n, &{&1, &1 + 1}) == {:ok, 1}
     end
 
-    test "the shared stream advances globally rather than forking per process" do
-      Ambient.start_servers([Ambient.Random])
-      Ambient.Random.seed(7)
-      Ambient.set_shared([Ambient.Random])
-      on_exit(fn -> Ambient.set_private([Ambient.Random]) end)
+    test "the state advances globally rather than forking per process" do
+      Ambient.start_servers([Ambient.TestCounter])
+      Ambient.TestCounter.start(0)
+      Ambient.set_shared([Ambient.TestCounter])
+      on_exit(fn -> Ambient.set_private([Ambient.TestCounter]) end)
 
-      draws = for _ <- 1..4, do: unrelated(fn -> Ambient.Random.uniform(1_000_000) end)
-      assert length(Enum.uniq(draws)) > 1, "shared mode should advance one stream, not fork it"
+      draws = for _ <- 1..4, do: unrelated(fn -> Ambient.TestCounter.next() end)
+      assert draws == [0, 1, 2, 3], "shared mode should advance one value, not fork it"
     end
   end
 
