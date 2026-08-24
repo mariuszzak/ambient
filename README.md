@@ -213,6 +213,8 @@ The surface you'll use:
 
 ```elixir
 MyApp.Config.get(:key, default)     # read: override, else Application.get_env/3
+MyApp.Config.fetch(:key)            # {:ok, value} | :error – absent ≠ set to nil
+MyApp.Config.fetch!(:key)           # or raise
 MyApp.Config.put(:key, value)       # override for this process and its children
                                     # (put_override/2 is the same function)
 MyApp.Config.revert(:key)           # drop one override, back to app env
@@ -502,6 +504,7 @@ so each wrapper compiles to a direct call to the function it wraps:
 | Wrapper | Production build compiles to |
 |---|---|
 | `MyApp.Config.get/2` | `Application.get_env/3` |
+| `MyApp.Config.fetch/1` | `Application.fetch_env/2` |
 | `Ambient.Clock.utc_now/0` | `DateTime.utc_now/0` |
 | `MyApp.Tenant.current/0` | its fallback expression |
 

@@ -201,6 +201,41 @@ defmodule Ambient.ConfigTest do
     end
   end
 
+  describe "fetch/1 and fetch!/1" do
+    test "distinguish absent from set-to-nil" do
+      key = unique_key()
+      put_app_env(key, nil)
+
+      assert Config.fetch(key) == {:ok, nil}
+      assert Config.fetch(:definitely_unset) == :error
+    end
+
+    test "see the override layer" do
+      key = unique_key()
+      Config.put(key, "from-test")
+
+      assert Config.fetch(key) == {:ok, "from-test"}
+      assert Config.fetch!(key) == "from-test"
+    end
+
+    test "take paths, and miss on a missing leaf" do
+      key = unique_key()
+      put_app_env(key, client_id: "from-app")
+
+      assert Config.fetch([key, :client_id]) == {:ok, "from-app"}
+      assert Config.fetch([key, :nope]) == :error
+      assert Config.fetch([:definitely_unset, :nope]) == :error
+
+      Config.put([key, :client_id], nil)
+      assert Config.fetch([key, :client_id]) == {:ok, nil}
+    end
+
+    test "fetch!/1 raises when there is nothing to read" do
+      assert_raise ArgumentError, fn -> Config.fetch!(:definitely_unset) end
+      assert_raise ArgumentError, fn -> Config.get([], :x) end
+    end
+  end
+
   defp unique_key, do: :"cfg_#{System.unique_integer([:positive])}"
 
   defp put_app_env(key, value) do

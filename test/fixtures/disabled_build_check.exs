@@ -191,6 +191,17 @@ Check.assert!(
   "a nested get/2 must ignore a forged row – the path lookup should be compiled out"
 )
 
+# fetch/1 has its own compiled-out split, flat and nested.
+Check.assert!(
+  Ambient.DisabledCheckConfig.fetch([:disabled_check_group, :client_id]) == {:ok, "from-app"},
+  "a nested fetch/1 must ignore a forged row"
+)
+
+Check.assert!(
+  Ambient.DisabledCheckConfig.fetch(:definitely_unset) == :error,
+  "fetch/1 must miss for an absent key"
+)
+
 # The generated writers are gated too.
 Check.raises!("a generated set_shared/1", fn -> Ambient.DisabledCheckClock.set_shared() end)
 Check.raises!("a generated set_private/0", fn -> Ambient.DisabledCheckClock.set_private() end)

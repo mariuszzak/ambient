@@ -8,10 +8,10 @@ defmodule Ambient.Config do
         use Ambient.Config, otp_app: :my_app
       end
 
-  This generates the domain API – `get/2`, `put/2`, `revert/1`, `reset/0` –
-  where `get/2` reads a per-process override first (via
-  `Ambient.ProcessOverride`), then falls back to
-  `Application.get_env(:my_app, key, default)`.
+  This generates the domain API – `get/2`, `fetch/1`, `fetch!/1`, `put/2`,
+  `revert/1`, `reset/0` – where the reads check a per-process override first
+  (via `Ambient.ProcessOverride`), then fall back to
+  `Application.get_env/3` / `Application.fetch_env/2`.
 
   Underneath, `Ambient.Value` supplies the generic layer those wrap
   (`put_override/2`, `delete_override/1`, `delete_all/0`) plus `overridden?/1`,
@@ -106,8 +106,11 @@ defmodule Ambient.Config do
 
       def get([_ | _] = path, default) do
         case Ambient.Config.__normalize__(path) do
-          key when is_atom(key) -> get(key, default)
-          [head | rest] -> ambient_get_path(head, rest, default)
+          key when is_atom(key) ->
+            get(key, default)
+
+          [head | rest] ->
+            Ambient.Config.__get_path__(@ambient_table, @ambient_otp_app, head, rest, default)
         end
       end
 
@@ -115,27 +118,43 @@ defmodule Ambient.Config do
         get_or(key, Application.get_env(@ambient_otp_app, key, default))
       end
 
-      if @ambient_enabled do
-        # Longest-prefix resolution: an override on the exact path wins, then
-        # one on each shorter prefix, then app env. That is what keeps a
-        # wholesale `put(:oauth, …)` visible to a `get([:oauth, :client])`
-        # read – otherwise adding nesting would break every existing override.
-        defp ambient_get_path(head, rest, default) do
-          case Ambient.Config.__resolve__(@ambient_table, head, rest) do
-            {:ok, value, remaining} -> Ambient.Config.__dig__(value, remaining, default)
-            :error -> ambient_app_env_path(head, rest, default)
-          end
-        end
-      else
-        defp ambient_get_path(head, rest, default) do
-          ambient_app_env_path(head, rest, default)
+      @doc """
+      Fetch a config value, distinguishing "absent" from "set to nil".
+
+      `{:ok, value}` when an override or an app-env entry is in scope, `:error`
+      otherwise – the `Application.fetch_env/2` shape, with the same override
+      layer and the same [path support](`Ambient.Config`) as `get/2`.
+      """
+      @spec fetch(Ambient.Config.key()) :: {:ok, term()} | :error
+      def fetch(key)
+
+      def fetch([]), do: Ambient.Config.__normalize__([])
+
+      def fetch([_ | _] = path) do
+        case Ambient.Config.__normalize__(path) do
+          key when is_atom(key) ->
+            fetch(key)
+
+          [head | rest] ->
+            Ambient.Config.__fetch_path__(@ambient_table, @ambient_otp_app, head, rest)
         end
       end
 
-      defp ambient_app_env_path(head, rest, default) do
-        case Application.fetch_env(@ambient_otp_app, head) do
-          {:ok, value} -> Ambient.Config.__dig__(value, rest, default)
-          :error -> default
+      def fetch(key), do: Ambient.Config.__fetch__(@ambient_table, @ambient_otp_app, key)
+
+      @doc """
+      Fetch a config value or raise. The `Application.fetch_env!/2` shape.
+      """
+      @spec fetch!(Ambient.Config.key()) :: term()
+      def fetch!(key) do
+        case fetch(key) do
+          {:ok, value} ->
+            value
+
+          :error ->
+            raise ArgumentError,
+                  "no config for #{inspect(key)} in #{inspect(@ambient_otp_app)}, " <>
+                    "and no override in scope"
         end
       end
 
@@ -171,7 +190,83 @@ defmodule Ambient.Config do
         )
       end
 
-      defoverridable get: 1, get: 2, put: 2, revert: 1, reset: 0, overridden?: 1
+      defoverridable get: 1,
+                     get: 2,
+                     fetch: 1,
+                     fetch!: 1,
+                     put: 2,
+                     revert: 1,
+                     reset: 0,
+                     overridden?: 1
+    end
+  end
+
+  @enabled Application.compile_env(:ambient, :enable_overrides, false)
+
+  # The path and fetch resolvers live here rather than inside `__using__`'s
+  # quote: they need the compile-time switch, and `Ambient.Config` is compiled
+  # with the same flag, so splitting once here keeps every generated module
+  # small (and Credo's long-quote check happy).
+  if @enabled do
+    @doc false
+    @spec __get_path__(atom(), atom(), atom(), [atom()], term()) :: term()
+    def __get_path__(table, otp_app, head, rest, default) do
+      # Longest-prefix resolution: an override on the exact path wins, then one
+      # on each shorter prefix, then app env. That is what keeps a wholesale
+      # `put(:oauth, …)` visible to a `get([:oauth, :client_id])` read –
+      # otherwise adding nesting would break every existing override.
+      case __resolve__(table, head, rest) do
+        {:ok, value, remaining} -> __dig__(value, remaining, default)
+        :error -> app_env_path(otp_app, head, rest, default)
+      end
+    end
+
+    @doc false
+    @spec __fetch__(atom(), atom(), atom()) :: {:ok, term()} | :error
+    def __fetch__(table, otp_app, key) do
+      case Ambient.ProcessOverride.fetch(table, key) do
+        {:ok, value} -> {:ok, value}
+        :error -> Application.fetch_env(otp_app, key)
+      end
+    end
+
+    @doc false
+    @spec __fetch_path__(atom(), atom(), atom(), [atom()]) :: {:ok, term()} | :error
+    def __fetch_path__(table, otp_app, head, rest) do
+      case __resolve__(table, head, rest) do
+        {:ok, value, remaining} -> __fetch_dig__(value, remaining)
+        :error -> app_env_fetch_path(otp_app, head, rest)
+      end
+    end
+  else
+    @doc false
+    @spec __get_path__(atom(), atom(), atom(), [atom()], term()) :: term()
+    def __get_path__(_table, otp_app, head, rest, default) do
+      app_env_path(otp_app, head, rest, default)
+    end
+
+    @doc false
+    @spec __fetch__(atom(), atom(), atom()) :: {:ok, term()} | :error
+    def __fetch__(_table, otp_app, key), do: Application.fetch_env(otp_app, key)
+
+    @doc false
+    @spec __fetch_path__(atom(), atom(), atom(), [atom()]) :: {:ok, term()} | :error
+    def __fetch_path__(_table, otp_app, head, rest) do
+      app_env_fetch_path(otp_app, head, rest)
+    end
+  end
+
+  defp app_env_path(otp_app, head, rest, default) do
+    case Application.fetch_env(otp_app, head) do
+      {:ok, value} -> __dig__(value, rest, default)
+      :error -> default
+    end
+  end
+
+  defp app_env_fetch_path(otp_app, head, rest) do
+    case Application.fetch_env(otp_app, head) do
+      {:ok, value} -> __fetch_dig__(value, rest)
+      :error -> :error
     end
   end
 
@@ -199,6 +294,17 @@ defmodule Ambient.Config do
         :error -> {:cont, acc}
       end
     end)
+  end
+
+  @doc false
+  @spec __fetch_dig__(term(), [atom()]) :: {:ok, term()} | :error
+  def __fetch_dig__(value, []), do: {:ok, value}
+
+  def __fetch_dig__(value, [key | rest]) do
+    case __step__(value, key) do
+      {:ok, next} -> __fetch_dig__(next, rest)
+      :error -> :error
+    end
   end
 
   @doc false

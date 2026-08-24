@@ -46,6 +46,10 @@ ambient values of your own.
   longest-prefix-first, so an existing wholesale `put(:oauth, …)` stays visible
   to a leaf read. A one-element path is the same key as the bare atom. The
   disabled build resolves paths straight out of app env with no ETS lookup.
+- **`fetch/1` and `fetch!/1` on a generated config accessor**, the
+  `Application.fetch_env/2` shape – so "absent" stays distinguishable from "set
+  to `nil`", and code doing `fetch_env` doesn't have to stay on the global
+  reader. Both take paths and both compile out of a disabled build.
 
 ### Fixed
 - **A raising `get_and_update/3` callback took down the table's `Server`.** The
