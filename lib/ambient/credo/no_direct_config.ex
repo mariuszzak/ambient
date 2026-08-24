@@ -80,22 +80,37 @@ if Code.ensure_loaded?(Credo.Check) do
 
     defp traverse(ast, issues, _ctx), do: {ast, issues}
 
-    defp maybe_issue(issues, {issue_meta, otp_app, replacement}, meta, fun, app)
-         when app == otp_app do
-      banned = "Application.#{fun}(#{inspect(otp_app)}, …)"
+    defp maybe_issue(issues, {issue_meta, otp_app, replacement}, meta, fun, app) do
+      case app_label(app, otp_app) do
+        nil ->
+          issues
 
-      issue =
-        format_issue(issue_meta,
-          message:
-            "#{banned} bypasses #{replacement} – its per-process override layer won't apply. " <>
-              "Use #{replacement}.get/2 instead.",
-          trigger: "Application.#{fun}",
-          line_no: meta[:line]
-        )
+        label ->
+          banned = "Application.#{fun}(#{label}, …)"
 
-      [issue | issues]
+          issue =
+            format_issue(issue_meta,
+              message:
+                "#{banned} bypasses #{replacement} – its per-process override layer won't apply. " <>
+                  "Use #{replacement}.get/2 instead.",
+              trigger: "Application.#{fun}",
+              line_no: meta[:line]
+            )
+
+          [issue | issues]
+      end
     end
 
-    defp maybe_issue(issues, _ctx, _meta, _fun, _app), do: issues
+    defp app_label(app, otp_app) when app == otp_app, do: inspect(otp_app)
+
+    # `Application.get_env(@otp_app, :key)` is one of the commonest ways to
+    # write this, and an attribute's *value* isn't in the AST – so matching
+    # only a literal atom missed the form entirely. Assume an attribute names
+    # this app: a check that silently skips the usual spelling is worse than
+    # one that occasionally over-flags, and `# credo:disable-for-next-line`
+    # covers reading another app's config through an attribute.
+    defp app_label({:@, _, [{attr, _, nil}]}, _otp_app) when is_atom(attr), do: "@#{attr}"
+
+    defp app_label(_app, _otp_app), do: nil
   end
 end

@@ -91,6 +91,30 @@ defmodule Ambient.CredoChecksTest do
       assert issue.message =~ "MyApp.Config"
     end
 
+    test "flags the @otp_app attribute form" do
+      # Regression: the guard matched a literal atom, so the commonest spelling
+      # of the banned call was invisible to the check.
+      [issue] =
+        """
+        @otp_app :my_app
+        def f, do: Application.get_env(@otp_app, :x)
+        """
+        |> to_source_file("lib/app/foo.ex")
+        |> run_check(NoDirectConfig, @params)
+
+      assert issue.trigger == "Application.get_env"
+      assert issue.message =~ "Application.get_env(@otp_app, …)"
+    end
+
+    test "flags a nested read written as get_env(...)[:key]" do
+      [issue] =
+        "def f, do: Application.get_env(:my_app, :oauth)[:client_id]"
+        |> to_source_file("lib/app/foo.ex")
+        |> run_check(NoDirectConfig, @params)
+
+      assert issue.trigger == "Application.get_env"
+    end
+
     test "does not flag other apps' config" do
       "def f, do: Application.get_env(:phoenix, :x)"
       |> to_source_file("lib/app/foo.ex")

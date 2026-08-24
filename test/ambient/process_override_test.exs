@@ -187,6 +187,29 @@ defmodule Ambient.ProcessOverrideTest do
       Process.exit(other, :kill)
     end
 
+    test "an allow cycle still falls through to $callers" do
+      # Regression: hitting an already-visited pid returned nil from the whole
+      # recursion, so a cycle anywhere in the grants discarded an answer the
+      # caller chain would have found.
+      PO.put(@table, :cycled_key, :from_parent)
+      parent = self()
+
+      task =
+        Task.async(fn ->
+          me = self()
+          other = spawn(fn -> Process.sleep(:infinity) end)
+          PO.allow(@table, me, other)
+          PO.allow(@table, other, me)
+          # `parent` is in this task's $callers, and owns the key.
+          result = PO.fetch(@table, :cycled_key)
+          Process.exit(other, :kill)
+          send(parent, :done)
+          result
+        end)
+
+      assert Task.await(task) == {:ok, :from_parent}
+    end
+
     test "resolves through a recursive (2-hop) allow chain" do
       PO.put(@table, :chained, :ok3)
       parent = self()

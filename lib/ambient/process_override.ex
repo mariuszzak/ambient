@@ -459,30 +459,29 @@ defmodule Ambient.ProcessOverride do
   end
 
   # Resolve which process owns an override for *this specific key*, walking
-  # self → allow chain → `$callers`. `visited` guards against a cycle in the
-  # allow chain (A allows B, B allows A, or a self-allow), which would
-  # otherwise spin forever. Resolution is key-aware: a table may host many
-  # keys owned by different ancestors, so we must match on the key, not merely
-  # "owns some key".
+  # self → allow chain → `$callers`. Resolution is key-aware: a table may host
+  # many keys owned by different ancestors, so we must match on the key, not
+  # merely "owns some key".
+  #
+  # `visited` guards against a cycle in the allow chain (A allows B, B allows
+  # A, or a self-allow), which would otherwise spin forever. Stopping at a
+  # cycle must not abandon the *whole* lookup, though: `$callers` is a separate
+  # source of truth, and a reader whose grants happen to loop still has one.
+  # So a cycle falls through to the caller chain rather than returning nil.
+  #
   # `visited` is a plain list: an allow chain is a handful of pids at most, and
   # MapSet's opaque type upsets dialyzer here for no benefit at this size.
   @spec find_owner(pid(), table(), key(), [pid()]) :: pid() | nil
   defp find_owner(pid, table, key, visited) do
     cond do
-      pid in visited ->
-        nil
-
       key_present?(table, pid, key) ->
         pid
 
-      owner = allowed_owner(table, pid) ->
+      (owner = allowed_owner(table, pid)) && owner not in [pid | visited] ->
         find_owner(owner, table, key, [pid | visited])
 
-      caller = first_caller_with_key(table, key) ->
-        caller
-
       true ->
-        nil
+        first_caller_with_key(table, key)
     end
   end
 
