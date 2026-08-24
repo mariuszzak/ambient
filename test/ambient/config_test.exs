@@ -105,6 +105,102 @@ defmodule Ambient.ConfigTest do
     end
   end
 
+  describe "nested keys" do
+    test "get/2 digs a path out of a keyword group in app env" do
+      key = unique_key()
+      put_app_env(key, client_id: "from-app", secret: "s")
+
+      assert Config.get([key, :client_id]) == "from-app"
+    end
+
+    test "get/2 digs through maps and several levels" do
+      key = unique_key()
+      put_app_env(key, %{google: [tts: %{voice: "en-US"}]})
+
+      assert Config.get([key, :google, :tts, :voice]) == "en-US"
+    end
+
+    test "get/2 returns the default for a missing leaf, group or step" do
+      key = unique_key()
+      put_app_env(key, client_id: "x")
+
+      assert Config.get([key, :nope], :fallback) == :fallback
+      assert Config.get([:definitely_unset, :nope], :fallback) == :fallback
+      # `client_id` is a string, so there is nothing to step into.
+      assert Config.get([key, :client_id, :deeper], :fallback) == :fallback
+    end
+
+    test "put/2 overrides the leaf without touching app env or its siblings" do
+      key = unique_key()
+      put_app_env(key, client_id: "from-app", secret: "kept")
+
+      Config.put([key, :client_id], "from-test")
+
+      assert Config.get([key, :client_id]) == "from-test"
+      assert Config.get([key, :secret]) == "kept"
+      assert Application.get_env(:ambient, key)[:client_id] == "from-app"
+    end
+
+    test "a group override is visible to a leaf read (longest prefix wins)" do
+      key = unique_key()
+      put_app_env(key, client_id: "from-app")
+
+      # Overriding the whole group must keep working now that leaf reads exist.
+      Config.put(key, client_id: "from-group")
+      assert Config.get([key, :client_id]) == "from-group"
+
+      # …and an override on the exact path beats the group one.
+      Config.put([key, :client_id], "from-leaf")
+      assert Config.get([key, :client_id]) == "from-leaf"
+
+      Config.revert([key, :client_id])
+      assert Config.get([key, :client_id]) == "from-group"
+    end
+
+    test "an override to nil at a path wins over the default" do
+      key = unique_key()
+      put_app_env(key, client_id: "from-app")
+
+      Config.put([key, :client_id], nil)
+      assert Config.get([key, :client_id], :some_default) == nil
+    end
+
+    test "a one-element path is the same key as the bare atom" do
+      key = unique_key()
+      put_app_env(key, "app-value")
+
+      Config.put([key], "override")
+      assert Config.get(key) == "override"
+      assert Config.get([key]) == "override"
+      assert Config.overridden?([key])
+      assert Config.overridden?(key)
+
+      Config.revert([key])
+      assert Config.get(key) == "app-value"
+    end
+
+    test "overridden?/1 asks about the exact key, not the resolved read" do
+      key = unique_key()
+      Config.put(key, client_id: "from-group")
+
+      assert Config.overridden?(key)
+      refute Config.overridden?([key, :client_id])
+    end
+
+    test "a path override is inherited by spawned children" do
+      key = unique_key()
+      Config.put([key, :client_id], "from-test")
+
+      assert Task.async(fn -> Config.get([key, :client_id]) end) |> Task.await() ==
+               "from-test"
+    end
+
+    test "an empty path is a bad argument" do
+      assert_raise ArgumentError, fn -> Config.get([], :fallback) end
+      assert_raise ArgumentError, fn -> Config.put([], :value) end
+    end
+  end
+
   defp unique_key, do: :"cfg_#{System.unique_integer([:positive])}"
 
   defp put_app_env(key, value) do

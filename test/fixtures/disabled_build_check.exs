@@ -194,6 +194,30 @@ Check.assert!(
   "overridden?/1 does still read ETS – if this changes, update the docs that say so"
 )
 
+# Nested reads take a different code path from flat ones, so they need their
+# own gate: the disabled build must resolve them straight out of app env, and
+# ignore a forged row at the exact path.
+Application.put_env(:ambient, :disabled_check_group, client_id: "from-app")
+
+Check.assert!(
+  Ambient.DisabledCheckConfig.get([:disabled_check_group, :client_id]) == "from-app",
+  "a nested get/2 must still read app env"
+)
+
+Check.assert!(
+  Ambient.DisabledCheckConfig.get([:disabled_check_group, :missing], :real) == :real,
+  "a nested get/2 must still return the default for a missing leaf"
+)
+
+config_table = Ambient.DisabledCheckConfig.__ambient_table__()
+:ets.new(config_table, [:named_table, :public, :set])
+:ets.insert(config_table, {{self(), [:disabled_check_group, :client_id]}, "forged"})
+
+Check.assert!(
+  Ambient.DisabledCheckConfig.get([:disabled_check_group, :client_id]) == "from-app",
+  "a nested get/2 must ignore a forged row – the path lookup should be compiled out"
+)
+
 # Battery-generated writers are gated too.
 Check.raises!("a generated set_shared/1", fn -> Ambient.DisabledCheckRandom.set_shared() end)
 Check.raises!("a generated set_private/0", fn -> Ambient.DisabledCheckRandom.set_private() end)
