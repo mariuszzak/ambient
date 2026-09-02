@@ -15,19 +15,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The floor declared in mix.exs. Its dialyzer is stricter about
+          # overloaded contracts than later ones – it caught an overlapping
+          # @spec that 1.17/1.18 passed silently.
           - elixir: "1.15"
             otp: "25"
           - elixir: "1.17"
-            otp: "27"
+            otp: "26"
           - elixir: "1.18"
             otp: "27"
+          - elixir: "1.19"
+            otp: "28"
+          # The newest toolchain, where the type checker is strictest and where
+          # this library is actually developed. Pre-release, so it reports but
+          # doesn't gate: a broken RC upstream shouldn't redden main.
+          - elixir: "1.20.0-rc.6"
+            otp: "29"
+            experimental: true
+    continue-on-error: ${{ matrix.experimental || false }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             deps

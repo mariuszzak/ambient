@@ -1,19 +1,18 @@
 defmodule Ambient.ProcessOverride do
   @moduledoc """
   ETS-backed process-local override store with cross-process inheritance –
-  the shared engine behind `Ambient.Clock`, `Ambient.Random`, `Ambient.Env`
-  and `Ambient.Config`, and behind any value module you build with
-  `Ambient.Value`.
+  the shared engine behind `Ambient.Clock` and `Ambient.Config`, and behind
+  any value module you build with `Ambient.Value`.
 
   ## Why
 
-  Tests need to override values (config, the clock, a random seed) for the
+  Tests need to override values (a config entry, the clock) for the
   duration of a single test process without polluting concurrent peers. The
   naive approach, `Process.put/2`, breaks the moment work crosses a process
   boundary (`Task.async`, `GenServer.cast`, an Oban worker spawned inline).
-  Both Phoenix's `ConnTest` and Ecto's SQL sandbox solve this with an explicit
-  "allow" mechanism plus the `$callers` chain. This module is the equivalent
-  for arbitrary key/value overrides.
+  `Ecto.Adapters.SQL.Sandbox` and `NimbleOwnership` (which backs Mox) both solve
+  this with an explicit "allow" mechanism plus the `$callers` chain. This module
+  is the equivalent for arbitrary key/value overrides.
 
   ## Lookup chain
 
@@ -23,9 +22,11 @@ defmodule Ambient.ProcessOverride do
     2. **allow chain** – `{:allow, child}` → `owner`, then recurse on `owner`.
        Used when a long-lived process (a GenServer the test didn't spawn) must
        read the test's overrides.
-    3. **`$callers`** – the implicit caller chain Erlang attaches to Task/Agent
+    3. **`$callers`** – the implicit caller chain Elixir attaches to `Task`
        spawns. The first ancestor that owns an override wins. No code change
-       needed for plain `Task.async` callers.
+       needed for plain `Task.async` callers. Note only `Task` sets it: an
+       `Agent` or `GenServer` child has `$ancestors` but no `$callers`, so it
+       resolves through step 2 or not at all.
 
   ## Modes
 
@@ -64,8 +65,8 @@ defmodule Ambient.ProcessOverride do
   It defaults to **`false`**. In a build that didn't opt in, no *Ambient* API
   can produce an override: `put/3` and `allow/3` raise; `Ambient.start_servers/1`,
   `Server.start_link/1` and `Server.init/1` refuse to create the ETS table; and
-  `Ambient.Random`'s seeded code paths aren't compiled at all. No seeds script,
-  remote console, `$callers` chain or `allow/3` grant re-opens them.
+  `Ambient.Value`'s `get_or/2` compiles its lookup away entirely. No setup
+  script, remote console, `$callers` chain or `allow/3` grant re-opens them.
 
   What it is *not*: `fetch/2` keeps its ETS lookup in disabled builds (see its
   docs for why), so code that hand-rolls `:ets.new(:ambient_clock_overrides,
@@ -73,10 +74,8 @@ defmodule Ambient.ProcessOverride do
   through `fetch/2` directly – including `mode/1` and the built-ins'
   `overridden?/1`. It is **not** visible to the built-ins' actual reads:
   `Ambient.Value`'s `get_or/2` compiles the lookup away, so `Clock.utc_now/0`
-  and a generated config `get/2` ignore such a row entirely. Forging one takes arbitrary
-  code execution inside the node anyway.
-  That is what makes `bytes/1` safe for credential material in production
-  while staying deterministic under `Ambient.Random.seed/1` in tests.
+  and a generated config `get/2` ignore such a row entirely. Forging one takes
+  arbitrary code execution inside the node anyway.
 
   Two more properties worth knowing:
 
@@ -87,6 +86,24 @@ defmodule Ambient.ProcessOverride do
       would carry the machinery. Build releases with `MIX_ENV=prod`.
 
   Check the current build with `enabled?/0`.
+
+  ## Dialyzer
+
+  Gate the flag on `config_env() != :prod`, not `== :test`. In a build without
+  overrides the writers raise, so their success typing is `none()` – and
+  `dialyxir` runs in `:dev` by default, which is exactly the build `== :test`
+  leaves without overrides. Ambient's own generated specs say `no_return()`
+  there, so the library stays clean either way, but a function of *yours* that
+  wraps a writer still can't return:
+
+      def enable(flag), do: put_override({:flag, flag}, true)
+      # warning: Function enable/1 has no local return
+
+  Measured on a small consuming app with one `use Ambient.Config` and one
+  `use Ambient.Value`: zero warnings under `!= :prod`, one under `== :test`.
+  If you'd rather keep `== :test`, move such wrappers behind
+  `if Ambient.ProcessOverride.enabled?()`, which compiles them out of the build
+  that couldn't run them anyway.
 
   ## API
 
@@ -106,8 +123,8 @@ defmodule Ambient.ProcessOverride do
   @enabled Application.compile_env(:ambient, :enable_overrides, false)
 
   # The one way a consumer defeats the switch is hard-coding it on, which puts
-  # the machinery in the release and makes `Random.bytes/1` downgradeable
-  # again. Warn while compiling into a prod build.
+  # the machinery in the release, where a stray override can reach real traffic.
+  # Warn while compiling into a prod build.
   #
   # Not `Mix.env/0`: Mix compiles dependencies with `env: :prod` by default, so
   # inside a dep it always reads `:prod`, even for a consumer's test build.
@@ -121,9 +138,9 @@ defmodule Ambient.ProcessOverride do
           Path.basename(Mix.Project.build_path()) == "prod") do
     IO.warn(
       "Ambient was compiled into a :prod build with `enable_overrides: true`. " <>
-        "That build carries the override machinery, so Ambient.Random.bytes/1 " <>
-        "can be downgraded to a seeded stream by any ambient seed. Derive the " <>
-        "flag from the env: `config :ambient, enable_overrides: config_env() != :prod`.",
+        "That build carries the override machinery, so a stray override or " <>
+        "allow/3 grant can reach real traffic. Derive the flag from the env: " <>
+        "`config :ambient, enable_overrides: config_env() != :prod`.",
       []
     )
   end
@@ -208,8 +225,8 @@ defmodule Ambient.ProcessOverride do
     While shared, only `owner_pid` may write to the table (`put/3` from anyone
     else raises `{:not_shared_owner, pid}`) and `allow/3` is refused – every
     process already reads the owner's values, so there is nothing to grant.
-    `get_and_update/3` is the exception, so read-modify-write modules like
-    `Ambient.Random` keep working – atomically – from every process.
+    `get_and_update/3` is the exception, so read-modify-write values keep
+    working – atomically – from every process.
 
     Handing over to a different owner is the current owner's call: once shared,
     `set_shared/2` from anyone else raises `{:not_shared_owner, pid}` rather
@@ -249,21 +266,30 @@ defmodule Ambient.ProcessOverride do
     result. Returns `{:ok, value}` where `value` is `fun`'s first element, or
     `:error` if no override is in scope.
 
-    For values whose reads *write*: `Ambient.Random` advances its seed state on
-    every draw. A plain `fetch/2` then `put/3` is fine in private mode, where
-    each process owns its own row, but in shared mode every process is reading
-    and writing the *same* row – so two concurrent draws read the same state,
-    compute the same number and overwrite each other. Measured before this
-    existed: 99 lost updates in 200 concurrent draws, i.e. half the callers got
-    a duplicate.
+    For values whose reads *write*: a counter that hands out the next id, a
+    budget that decrements. A plain `fetch/2` then `put/3` is fine in private
+    mode, where each process owns its own row, but in shared mode every process
+    is reading and writing the *same* row – so two concurrent reads see the same
+    state, compute the same result and overwrite each other. Measured before
+    this existed: 99 lost updates in 200 concurrent reads, i.e. half the callers
+    got a duplicate.
 
     In shared mode the whole read-modify-write therefore happens inside the
     `Server`, which serialises it. Private mode stays client-side, since a
     process can't race itself.
 
+    If `fun` raises (or returns something other than a two-tuple), the
+    exception surfaces in the *caller* in both modes. In shared mode it is
+    caught inside the `Server` and re-raised here, because letting it escape
+    there would take the table owner down with it and void every override in
+    the table – so the stacktrace is the one captured Server-side. A raise
+    inside `fun` keeps its own frame; the `MatchError` for a malformed return
+    is reported against the `Server`. Private mode runs client-side and is
+    unaffected.
+
     Note what this does *not* buy: which concurrent caller gets which value
     still depends on scheduling. One advancing stream and reproducible ordering
-    are mutually exclusive under concurrency – see `Ambient.Random`.
+    are mutually exclusive under concurrency.
     """
     @spec get_and_update(table(), key(), (value() -> {result, value()})) :: {:ok, result} | :error
           when result: term()
@@ -276,7 +302,21 @@ defmodule Ambient.ProcessOverride do
           :error
 
         owner = shared_owner(table) ->
-          GenServer.call(server_name(table), {:get_and_update, owner, key, fun})
+          # `:infinity`: the Server runs `fun` inline, so a slow callback or a
+          # deep queue counts against the caller's timeout – and a caller that
+          # gives up while the Server still applies the write consumes a value
+          # nobody receives. This is test-only infrastructure with no liveness
+          # requirement; blocking is strictly better than that.
+          case GenServer.call(server_name(table), {:get_and_update, owner, key, fun}, :infinity) do
+            # `fun` raised inside the Server. It caught it rather than dying
+            # with the table; re-raise here so the caller sees its own
+            # exception with its own stacktrace, exactly as in private mode.
+            {:ambient_raise, kind, reason, stacktrace} ->
+              :erlang.raise(kind, reason, stacktrace)
+
+            result ->
+              result
+          end
 
         true ->
           with {:ok, current} <- fetch(table, key) do
@@ -429,30 +469,29 @@ defmodule Ambient.ProcessOverride do
   end
 
   # Resolve which process owns an override for *this specific key*, walking
-  # self → allow chain → `$callers`. `visited` guards against a cycle in the
-  # allow chain (A allows B, B allows A, or a self-allow), which would
-  # otherwise spin forever. Resolution is key-aware: a table may host many
-  # keys owned by different ancestors, so we must match on the key, not merely
-  # "owns some key".
+  # self → allow chain → `$callers`. Resolution is key-aware: a table may host
+  # many keys owned by different ancestors, so we must match on the key, not
+  # merely "owns some key".
+  #
+  # `visited` guards against a cycle in the allow chain (A allows B, B allows
+  # A, or a self-allow), which would otherwise spin forever. Stopping at a
+  # cycle must not abandon the *whole* lookup, though: `$callers` is a separate
+  # source of truth, and a reader whose grants happen to loop still has one.
+  # So a cycle falls through to the caller chain rather than returning nil.
+  #
   # `visited` is a plain list: an allow chain is a handful of pids at most, and
   # MapSet's opaque type upsets dialyzer here for no benefit at this size.
   @spec find_owner(pid(), table(), key(), [pid()]) :: pid() | nil
   defp find_owner(pid, table, key, visited) do
     cond do
-      pid in visited ->
-        nil
-
       key_present?(table, pid, key) ->
         pid
 
-      owner = allowed_owner(table, pid) ->
+      (owner = allowed_owner(table, pid)) && owner not in [pid | visited] ->
         find_owner(owner, table, key, [pid | visited])
 
-      caller = first_caller_with_key(table, key) ->
-        caller
-
       true ->
-        nil
+        first_caller_with_key(table, key)
     end
   end
 

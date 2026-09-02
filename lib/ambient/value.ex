@@ -3,25 +3,39 @@ defmodule Ambient.Value do
   Build your own overridable value on top of `Ambient.ProcessOverride`.
 
   An *ambient value* is one resolved implicitly from the surrounding context
-  rather than threaded through arguments. `Ambient.Config`, `Ambient.Clock`,
-  `Ambient.Random` and `Ambient.Env` are all built on this module – nothing
-  about them is privileged. If your app has an ambient value of its own (the
-  current tenant, the acting user, a request id), this is the supported way to
-  make it as testable as the built-in ones.
+  rather than threaded through arguments. `Ambient.Config` and `Ambient.Clock`
+  are both built on this module – nothing about them is privileged. If your app
+  reads a value from the runtime rather than receiving it as an argument, this
+  is the supported way to make it as testable as they are.
 
-      defmodule MyApp.Tenant do
-        use Ambient.Value, table: :my_app_tenant_overrides
+      defmodule MyApp.Flags do
+        use Ambient.Value, table: :my_app_flag_overrides
 
-        @doc "The tenant for the current process, or the default."
-        def current, do: get_or(:tenant, MyApp.Tenant.Default)
+        @doc "Is `flag` on for `actor`? In production, the real flag lookup."
+        def enabled?(flag, actor \\ nil) do
+          get_or({:flag, flag}, FunWithFlags.enabled?(flag, for: actor))
+        end
 
-        @doc "Pin the tenant for this test and everything it spawns."
-        def put(tenant), do: put_override(:tenant, tenant)
+        @doc "Pin it for this test and everything it spawns."
+        def enable(flag), do: put_override({:flag, flag}, true)
+        def disable(flag), do: put_override({:flag, flag}, false)
       end
+
+  Note what stays a parameter: `actor` is passed in. The flag lookup is ambient
+  because nothing threads it; who it is evaluated *for* is an argument.
+
+  **The fallback must be the real production implementation.** In a build
+  without overrides the lookup isn't compiled, so the fallback is all that is
+  left. If it is a stub or a constant, production uses that stub forever and
+  what you have is a test-only global with an app-shaped API.
+
+  **Don't make authorization ambient.** The current tenant and the acting user
+  decide what a request may see, so an override that outlives its test is a
+  data-exposure bug rather than a wrong timestamp. Thread those explicitly.
 
   Register it once in `test/test_helper.exs`, exactly like a built-in:
 
-      Ambient.start_servers([Ambient.Clock, MyApp.Tenant])
+      Ambient.start_servers([Ambient.Clock, MyApp.Flags])
 
   ## What you get
 
@@ -42,7 +56,8 @@ defmodule Ambient.Value do
   too.
 
   A module holding a single value conventionally uses one sentinel key
-  (`:clock`, `:tenant`); one holding many (like `Ambient.Config`) keys by name.
+  (`:clock`); one holding many (like `Ambient.Config` or the flags above) keys
+  by name.
 
   ## `get_or/2` is a macro, on purpose
 
@@ -50,9 +65,9 @@ defmodule Ambient.Value do
   (see `Ambient.ProcessOverride`) the whole lookup disappears and only the
   fallback expression remains:
 
-      def current, do: get_or(:tenant, MyApp.Tenant.Default)
+      def enabled?(flag, actor), do: get_or({:flag, flag}, FunWithFlags.enabled?(flag, for: actor))
       # in a production build, compiles to exactly:
-      def current, do: MyApp.Tenant.Default
+      def enabled?(flag, actor), do: FunWithFlags.enabled?(flag, for: actor)
 
   That is what keeps a wrapper free to use everywhere in production code. The
   fallback is only evaluated when there is no override, so
@@ -80,10 +95,9 @@ defmodule Ambient.Value do
 
       @ambient_table unquote(table)
 
-      # Exposed so a module can compile out a branch of its own, the way
-      # `Ambient.Env.get/2` drops its "overridden as unset" clause. Use it in
-      # the module body – it is a compile-time constant, so a runtime `if` on
-      # it is just dead code.
+      # Exposed so a module can compile out a branch of its own – a clause that
+      # would be provably dead in a disabled build. Use it in the module body:
+      # it is a compile-time constant, so a runtime `if` on it is just dead code.
       @ambient_enabled unquote(@enabled)
 
       @doc false

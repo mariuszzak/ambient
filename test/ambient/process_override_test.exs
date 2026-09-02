@@ -63,7 +63,7 @@ defmodule Ambient.ProcessOverrideTest do
     test "get_and_update/3 misses instead of raising" do
       # Regression: get_and_update/3 reached shared_owner/1 – a bare
       # :ets.lookup – before any existence check, so it raised ArgumentError
-      # from ETS. Every Ambient.Random *read* goes through here, so forgetting
+      # from ETS. Every read-modify-write draw goes through here, so forgetting
       # start_servers/1 crashed uniform/bytes/shuffle instead of letting them
       # fall through to :rand.
       assert PO.get_and_update(:ambient_nonexistent_table, :k, fn s -> {s, s} end) == :error
@@ -185,6 +185,29 @@ defmodule Ambient.ProcessOverrideTest do
       # neither owns the key – must terminate, not spin forever
       assert PO.fetch(@table, :cycle_key) == :error
       Process.exit(other, :kill)
+    end
+
+    test "an allow cycle still falls through to $callers" do
+      # Regression: hitting an already-visited pid returned nil from the whole
+      # recursion, so a cycle anywhere in the grants discarded an answer the
+      # caller chain would have found.
+      PO.put(@table, :cycled_key, :from_parent)
+      parent = self()
+
+      task =
+        Task.async(fn ->
+          me = self()
+          other = spawn(fn -> Process.sleep(:infinity) end)
+          PO.allow(@table, me, other)
+          PO.allow(@table, other, me)
+          # `parent` is in this task's $callers, and owns the key.
+          result = PO.fetch(@table, :cycled_key)
+          Process.exit(other, :kill)
+          send(parent, :done)
+          result
+        end)
+
+      assert Task.await(task) == {:ok, :from_parent}
     end
 
     test "resolves through a recursive (2-hop) allow chain" do

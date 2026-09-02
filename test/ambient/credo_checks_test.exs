@@ -1,7 +1,7 @@
 defmodule Ambient.CredoChecksTest do
   use Credo.Test.Case
 
-  alias Ambient.Credo.{NoDirectClock, NoDirectConfig, NoDirectEnv, NoDirectRandom}
+  alias Ambient.Credo.{NoDirectClock, NoDirectConfig}
 
   describe "NoDirectClock" do
     test "flags DateTime.utc_now/0 and suggests Ambient.Clock" do
@@ -49,25 +49,13 @@ defmodule Ambient.CredoChecksTest do
 
   describe "piped calls" do
     # Regression: a pipe leaves the receiver out of the call node, so an entry
-    # pinning an exact arity never matched. `Enum.shuffle/1` is overwhelmingly
-    # written piped, which meant NoDirectRandom missed its most common form.
+    # pinning an exact arity never matched – and the piped form is a common way
+    # to write these calls.
     test "are flagged with the right arity, in every check" do
-      assert [issue] =
-               "def f(l), do: l |> Enum.shuffle()"
+      assert [%{trigger: "DateTime.now/1"}] =
+               ~S{def f(zone), do: zone |> DateTime.now()}
                |> to_source_file("lib/app/foo.ex")
-               |> run_check(NoDirectRandom)
-
-      assert issue.trigger == "Enum.shuffle/1"
-
-      assert [%{trigger: "Enum.take_random/2"}] =
-               "def f(l), do: l |> Enum.take_random(2)"
-               |> to_source_file("lib/app/foo.ex")
-               |> run_check(NoDirectRandom)
-
-      assert [%{trigger: "System.fetch_env!/1"}] =
-               ~S{def f(v), do: v |> System.fetch_env!()}
-               |> to_source_file("lib/app/foo.ex")
-               |> run_check(NoDirectEnv)
+               |> run_check(NoDirectClock)
 
       assert [%{trigger: "Application.get_env"}] =
                "def f, do: :my_app |> Application.get_env(:k)"
@@ -76,182 +64,16 @@ defmodule Ambient.CredoChecksTest do
     end
 
     test "are flagged once, not once per pipe stage" do
-      assert [%{trigger: "Enum.shuffle/1"}] =
-               "def f(l), do: l |> Enum.shuffle() |> Enum.take(2)"
+      assert [%{trigger: "Application.get_env"}] =
+               "def f, do: :my_app |> Application.get_env(:k) |> to_string()"
                |> to_source_file("lib/app/foo.ex")
-               |> run_check(NoDirectRandom)
+               |> run_check(NoDirectConfig, otp_app: :my_app)
     end
 
     test "leave innocent pipes alone" do
       "def f(l), do: l |> Enum.map(& &1) |> Enum.sort()"
       |> to_source_file("lib/app/foo.ex")
-      |> run_check(NoDirectRandom)
-      |> refute_issues()
-    end
-  end
-
-  describe "NoDirectEnv" do
-    test "flags System.get_env/1 and suggests Ambient.Env" do
-      [issue] =
-        "def f, do: System.get_env(\"HOME\")"
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectEnv)
-
-      assert issue.trigger == "System.get_env/1"
-      assert issue.message =~ "Ambient.Env.get/2"
-    end
-
-    test "names functions that actually exist on the wrapper" do
-      # Regression: the check suggested `Ambient.Env.delete/1`, which the
-      # unset/1 rename had removed – so it handed developers a name that
-      # doesn't compile. Getting this right is the check's whole job.
-      [issue] =
-        ~S|def f, do: System.delete_env("HOME")|
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectEnv)
-
-      assert issue.message =~ "Ambient.Env.unset/1"
-      assert function_exported?(Ambient.Env, :unset, 1)
-    end
-
-    test "flags System.put_env/2, which is VM-global and breaks async: true" do
-      [issue] =
-        ~S|def f, do: System.put_env("A", "1")|
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectEnv)
-
-      assert issue.trigger == "System.put_env/2"
-      assert issue.message =~ "Ambient.Env.put/2"
-    end
-
-    test "flags the capture form and Erlang :os.getenv/1" do
-      [capture] =
-        "def f, do: &System.fetch_env!/1"
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectEnv)
-
-      assert capture.trigger == "&System.fetch_env!/1"
-
-      [erl] =
-        ~S|def f, do: :os.getenv(~c"HOME")|
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectEnv)
-
-      assert erl.trigger == ":os.getenv/1"
-    end
-
-    test "respects :replacement and :exempt_suffixes" do
-      [issue] =
-        "def f, do: System.get_env(\"HOME\")"
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectEnv, replacement: "MyApp.Env")
-
-      assert issue.message =~ "MyApp.Env.get/2"
-
-      "def f, do: System.get_env(\"HOME\")"
-      |> to_source_file("config/runtime.exs")
-      |> run_check(NoDirectEnv, exempt_suffixes: ["config/runtime.exs"])
-      |> refute_issues()
-    end
-
-    test "does not flag Ambient.Env itself" do
-      "def f, do: System.get_env(\"HOME\")"
-      |> to_source_file("lib/ambient/env.ex")
-      |> run_check(NoDirectEnv)
-      |> refute_issues()
-    end
-  end
-
-  describe "NoDirectRandom" do
-    test "flags :rand.uniform/1" do
-      [issue] =
-        "def f, do: :rand.uniform(10)"
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectRandom)
-
-      assert issue.trigger == ":rand.uniform/1"
-      assert issue.message =~ "Ambient.Random.uniform"
-    end
-
-    test "flags the state-threading :rand.uniform_s/2 variant" do
-      [issue] =
-        "def f(s), do: :rand.uniform_s(10, s)"
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectRandom)
-
-      assert issue.trigger == ":rand.uniform_s/2"
-      assert issue.message =~ "Ambient.Random.uniform"
-    end
-
-    test "flags :rand.normal_s/3" do
-      [issue] =
-        "def f(s), do: :rand.normal_s(0, 1, s)"
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectRandom)
-
-      assert issue.trigger == ":rand.normal_s/3"
-      assert issue.message =~ "Ambient.Random.normal"
-    end
-
-    test "flags :rand.seed/2 and :rand.seed_s/2 (seeding bypasses the wrapper's own seed)" do
-      [seed_issue] =
-        "def f, do: :rand.seed(:exsss, {1, 2, 3})"
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectRandom)
-
-      assert seed_issue.trigger == ":rand.seed/2"
-      assert seed_issue.message =~ "Ambient.Random.seed"
-
-      [seed_s_issue] =
-        "def f, do: :rand.seed_s(:exsss, {1, 2, 3})"
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectRandom)
-
-      assert seed_s_issue.trigger == ":rand.seed_s/2"
-      assert seed_s_issue.message =~ "Ambient.Random.seed"
-    end
-
-    test "flags the &:rand.uniform_s/2 capture form" do
-      [issue] =
-        "def f, do: &:rand.uniform_s/2"
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectRandom)
-
-      assert issue.trigger == "&:rand.uniform_s/2"
-    end
-
-    test "does not flag the wrapper's own _s usage (Ambient.Random is exempt)" do
-      "def f(s), do: :rand.uniform_s(10, s)"
-      |> to_source_file("lib/ambient/random.ex")
-      |> run_check(NoDirectRandom)
-      |> refute_issues()
-    end
-
-    test "flags Enum.shuffle/1 but not Enum.map/2" do
-      [issue] =
-        "def f(l), do: Enum.shuffle(l)"
-        |> to_source_file("lib/app/foo.ex")
-        |> run_check(NoDirectRandom)
-
-      assert issue.trigger == "Enum.shuffle/1"
-
-      "def f(l), do: Enum.map(l, & &1)"
-      |> to_source_file("lib/app/foo.ex")
-      |> run_check(NoDirectRandom)
-      |> refute_issues()
-    end
-
-    test "does not flag :crypto.strong_rand_bytes/1" do
-      "def f, do: :crypto.strong_rand_bytes(16)"
-      |> to_source_file("lib/app/foo.ex")
-      |> run_check(NoDirectRandom)
-      |> refute_issues()
-    end
-
-    test "does not flag Ambient.Random itself" do
-      "def f(l), do: Enum.shuffle(l)"
-      |> to_source_file("lib/ambient/random.ex")
-      |> run_check(NoDirectRandom)
+      |> run_check(NoDirectClock)
       |> refute_issues()
     end
   end
@@ -267,6 +89,30 @@ defmodule Ambient.CredoChecksTest do
 
       assert issue.trigger == "Application.get_env"
       assert issue.message =~ "MyApp.Config"
+    end
+
+    test "flags the @otp_app attribute form" do
+      # Regression: the guard matched a literal atom, so the commonest spelling
+      # of the banned call was invisible to the check.
+      [issue] =
+        """
+        @otp_app :my_app
+        def f, do: Application.get_env(@otp_app, :x)
+        """
+        |> to_source_file("lib/app/foo.ex")
+        |> run_check(NoDirectConfig, @params)
+
+      assert issue.trigger == "Application.get_env"
+      assert issue.message =~ "Application.get_env(@otp_app, …)"
+    end
+
+    test "flags a nested read written as get_env(...)[:key]" do
+      [issue] =
+        "def f, do: Application.get_env(:my_app, :oauth)[:client_id]"
+        |> to_source_file("lib/app/foo.ex")
+        |> run_check(NoDirectConfig, @params)
+
+      assert issue.trigger == "Application.get_env"
     end
 
     test "does not flag other apps' config" do

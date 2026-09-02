@@ -12,7 +12,8 @@ defmodule Ambient.Clock do
   The override lives in `Ambient.ProcessOverride`, so any child process spawned
   by the test inherits the clock through:
 
-    * the implicit `$callers` chain (`Task`/`Agent` – no setup needed), and
+    * the implicit `$callers` chain (`Task` – no setup needed; `Agent` and
+      `GenServer` do not set it), and
     * explicit `Ambient.Clock.allow/2` for long-lived processes (GenServers,
       Oban workers).
 
@@ -25,7 +26,7 @@ defmodule Ambient.Clock do
       Ambient.Clock.utc_today()
 
   Use these instead of direct `DateTime.utc_now/0` / `Date.utc_today/0` calls
-  anywhere time must be testable. A custom Credo check can enforce the
+  anywhere time must be testable. The bundled `Ambient.Credo.NoDirectClock` check enforces the
   convention project-wide.
 
   ## Test usage

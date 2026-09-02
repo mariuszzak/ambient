@@ -1,7 +1,7 @@
 defmodule Ambient.MixProject do
   use Mix.Project
 
-  @version "0.1.1"
+  @version "0.2.0"
   @source_url "https://github.com/mariuszzak/ambient"
 
   def project do
@@ -32,8 +32,7 @@ defmodule Ambient.MixProject do
   end
 
   def application do
-    # `:crypto` backs the production path of `Ambient.Random.bytes/1`.
-    [extra_applications: [:logger, :crypto]]
+    [extra_applications: [:logger]]
   end
 
   def cli do
@@ -51,10 +50,10 @@ defmodule Ambient.MixProject do
   end
 
   defp description do
-    "Process-scoped value overrides for Elixir – a per-test config layer, a " <>
-      "frozen clock, a seeded RNG and overridable env vars that survive across " <>
-      "process boundaries, never leak between async tests, and compile out of " <>
-      "production builds."
+    "Per-process Application.get_env overrides, so config-dependent tests can " <>
+      "stay async: true – plus the same machinery for any ambient value of " <>
+      "your own. Overrides cross process boundaries, never leak between " <>
+      "concurrent tests, and compile out of production builds."
   end
 
   defp package do
@@ -84,13 +83,8 @@ defmodule Ambient.MixProject do
           Ambient.Supervisor,
           Ambient.Facade
         ],
-        "Built-in values": [Ambient.Config, Ambient.Clock, Ambient.Random, Ambient.Env],
-        "Credo checks": [
-          Ambient.Credo.NoDirectClock,
-          Ambient.Credo.NoDirectEnv,
-          Ambient.Credo.NoDirectRandom,
-          Ambient.Credo.NoDirectConfig
-        ]
+        "Built-in values": [Ambient.Config, Ambient.Clock],
+        "Credo checks": [Ambient.Credo.NoDirectConfig, Ambient.Credo.NoDirectClock]
       ]
     ]
   end

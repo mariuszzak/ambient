@@ -1,117 +1,85 @@
 # Ambient
 
-Process-scoped value overrides for Elixir – a frozen **clock**, a seeded
-**random number generator**, overridable **env vars** and a per-test **config**
-layer that survive across process boundaries, never leak between `async: true`
-tests, and cost nothing in production.
+Per-process `Application.get_env` overrides, so config-dependent tests can stay
+`async: true` – plus the same machinery for any ambient value of your own.
 
-An *ambient value* is one resolved implicitly from the surrounding context
-rather than threaded through arguments. Ambient lets a test set such a value –
-the current time, a random seed, `DATABASE_URL`, a config entry – scoped to its
-process **and everything that process spawns**, with automatic cleanup on exit.
+A test sets a value; it applies to that process **and everything that process
+spawns**, never to a concurrent test, and is cleaned up when the test exits. In
+production the override machinery isn't compiled in at all.
 
 ```elixir
-test "a token expires after 24 hours" do
-  Ambient.Clock.set(~U[2026-01-01 09:00:00Z])
-  token = Tokens.issue(user)          # any process it spawns sees this clock
+# test/billing_test.exs
+use ExUnit.Case, async: true
 
-  Ambient.Clock.advance(hours: 23)
-  assert Tokens.valid?(token)
+test "gives up after the configured number of retries" do
+  MyApp.Config.put(:retry_limit, 1)
 
-  Ambient.Clock.advance(hours: 2)
-  refute Tokens.valid?(token)
+  assert {:error, :exhausted} = Billing.charge(invoice)
 end
 ```
 
-- [Why](#why)
+```elixir
+# test/dunning_test.exs – runs concurrently with the file above
+use ExUnit.Case, async: true
+
+test "another module's override is invisible here" do
+  assert MyApp.Config.get(:retry_limit, 3) == 3
+end
+```
+
+No `setup`/`on_exit` pairing, no restoring the old value, no `async: false`.
+
 - [Install](#install)
-- [Built-in values](#built-in-values) – [Config](#config), [Clock](#clock), [Random](#random), [Env](#env)
+- [Config](#config) – [Nested keys](#nested-keys)
 - [Build your own](#build-your-own)
-- [Re-exporting under your own namespace](#re-exporting-under-your-own-namespace)
+- [Clock, the worked example](#clock-the-worked-example)
+- [Wrap it in your own namespace](#wrap-it-in-your-own-namespace)
 - [Reaching a process you didn't spawn](#reaching-a-process-you-didnt-spawn)
 - [Shared mode](#shared-mode-for-async-false-tests)
-- [Errors](#errors)
-- [The compile-time switch](#the-compile-time-switch)
-- [Dialyzer](#dialyzer)
-- [Production cost](#production-cost)
-- [Credo checks](#enforcing-the-conventions-optional-credo-checks)
 - [How it works](#how-it-works)
-- [How it compares](#how-it-compares)
-
-## Why
-
-Overriding a global for one test without disturbing its neighbours is
-surprisingly hard:
-
-| Approach | Per-test isolation | Survives a spawned process | Auto-cleanup |
-|---|---|---|---|
-| `Application.put_env/3` | ❌ global – breaks `async: true` | ✅ | ❌ |
-| `System.put_env/2` | ❌ global – breaks `async: true` | ✅ | ❌ |
-| `Process.put/2` | ✅ | ❌ lost across the boundary | ✅ (dies with the pid) |
-| **Ambient** | ✅ | ✅ (`$callers` + `allow/3`) | ✅ (monitored) |
-
-Ambient gives you `Process.put`-style isolation **plus** cross-process
-inheritance (the same `$callers` mechanism Ecto's SQL Sandbox uses, plus an
-explicit `allow/3` for long-lived processes), with values cleaned up
-automatically when the owning test process exits.
-
-And in production the override machinery isn't compiled in at all – see
-[Production cost](#production-cost).
+- [The compile-time switch and production cost](#the-compile-time-switch-and-production-cost)
+- [Credo checks](#enforcing-the-conventions-optional-credo-checks)
+- [Errors](#errors)
+- [Why config, and when not to](#why-config) – [Should you use this?](#should-you-use-this),
+  [What it costs to adopt](#what-it-costs-to-adopt), [How it compares](#how-it-compares)
 
 ## Install
 
 ```elixir
 def deps do
-  [{:ambient, "~> 0.1"}]
+  [{:ambient, "~> 0.2"}]
 end
 ```
 
-Not a test-only dependency: you read through `Ambient.Clock` and
-`MyApp.Config` from application code. The override machinery is what's absent
-from production, not the library – see [the compile-time
-switch](#the-compile-time-switch).
+Not a test-only dependency: you read through `MyApp.Config` and `MyApp.Clock`
+from application code. The override machinery is what's absent from production,
+not the library.
 
-Opt into the override machinery, in `config/config.exs`:
+Opt in, in `config/config.exs`:
 
 ```elixir
 config :ambient, enable_overrides: config_env() != :prod
 ```
 
 It defaults to `false`, so a build that doesn't set it – your release – has no
-override machinery compiled in at all. See [the compile-time
-switch](#the-compile-time-switch).
+override machinery compiled in at all. Gate on `!= :prod` rather than
+`== :test`: `:prod` is the only env where the guarantee matters, and Dialyzer
+runs in `:dev`.
 
-Gate on `!= :prod` rather than `== :test`: `:prod` is the only env where the
-guarantee matters, and Dialyzer runs in `:dev` – see
-[Dialyzer](#dialyzer).
-
-Then start one override server per table before the suite runs, in
-`test/test_helper.exs`:
+Then define your accessor and start one override server per table before the
+suite runs, in `test/test_helper.exs`:
 
 ```elixir
-Ambient.start_servers([Ambient.Clock, Ambient.Random, Ambient.Env, MyApp.Config])
+Ambient.start_servers([MyApp.Config, MyApp.Clock])
 ExUnit.start()
 ```
 
 Forgetting the config line fails loudly at `Ambient.start_servers/1`; forgetting
-a table surfaces at the first write to it, as `:server_not_started`.
+a table surfaces at the first write to it, as `:server_not_started`. That's also
+what you'll hit trying to set an override in `iex -S mix`, where nothing has
+started the servers – call `Ambient.start_servers/1` there too.
 
-A `use Ambient.Facade` wrapper can be registered in place of the module it
-wraps – it passes `__ambient_table__/0` through.
-
-## Built-in values
-
-Four ready-made ambient values. Each is a thin wrapper you call from
-application code instead of the global it replaces, plus test-only setters that
-are scoped to the calling process and everything it spawns.
-
-### Config
-
-The one most apps reach for first. `Application.get_env/3` is how Elixir apps
-read their settings, and `Application.put_env/3` is how tests usually override
-them – except that `put_env` mutates global state, so two `async: true` tests
-touching the same key clobber each other, and a value left behind leaks into
-every later test in the run.
+## Config
 
 Bind an accessor to your OTP app once:
 
@@ -131,31 +99,10 @@ def dunning_enabled?, do: MyApp.Config.get(:dunning_enabled, false)
 
 `get/2` checks for a process-local override first and falls back to
 `Application.get_env(:my_app, key, default)`. In a production build the lookup
-isn't compiled in at all – `get/2` *is* `Application.get_env/3` (see
-[Production cost](#production-cost)).
+isn't compiled in at all – `get/2` *is* `Application.get_env/3`.
 
-In tests, override per process. No `setup`/`on_exit` pairing, no restoring the
-old value, no `async: false`:
-
-```elixir
-use ExUnit.Case, async: true
-
-test "gives up after the configured number of retries" do
-  MyApp.Config.put(:retry_limit, 1)
-
-  assert {:error, :exhausted} = Billing.charge(invoice)
-end
-
-test "a concurrent test is unaffected" do
-  assert MyApp.Config.get(:retry_limit, 3) == 3
-end
-```
-
-The override dies with the test process, so the second test sees the real
-value even while the first is still running.
-
-It reaches spawned work too – a `Task` your code starts inherits it through
-`$callers` with no setup:
+The override dies with the test process, and reaches spawned work – a `Task`
+your code starts inherits it through `$callers` with no setup:
 
 ```elixir
 test "the background charge sees the override" do
@@ -166,18 +113,20 @@ test "the background charge sees the override" do
 end
 ```
 
-For a long-lived process the test didn't spawn – a named GenServer, an Oban
-worker – grant it access explicitly (see
+For a long-lived process the test didn't spawn – a supervised GenServer, a
+LiveView – grant it access explicitly (see
 [Reaching a process you didn't spawn](#reaching-a-process-you-didnt-spawn)):
 
 ```elixir
 MyApp.Config.allow(genserver_pid)
 ```
 
-The full surface:
+The surface you'll use:
 
 ```elixir
 MyApp.Config.get(:key, default)     # read: override, else Application.get_env/3
+MyApp.Config.fetch(:key)            # {:ok, value} | :error – absent ≠ set to nil
+MyApp.Config.fetch!(:key)           # or raise
 MyApp.Config.put(:key, value)       # override for this process and its children
 MyApp.Config.revert(:key)           # drop one override, back to app env
 MyApp.Config.reset()                # drop every override this process set
@@ -188,224 +137,292 @@ MyApp.Config.allow(pid)             # let another process read this one's overri
 Bind as many accessors as you have apps – each `otp_app` gets its own table, so
 an umbrella's apps never collide.
 
-### Clock
+### Nested keys
 
-Time is the other classic untestable global. Read it through `Ambient.Clock`
-and a test can freeze it, or travel, without `Process.sleep/1` or hand-rolled
-date arithmetic:
+Most real config isn't flat. `config :my_app, :oauth, client_id: "…"` reads
+back as a keyword list, so the call site is
+`Application.get_env(:my_app, :oauth)[:client_id]`. Pass a path and both the
+read and the override target the leaf:
+
+```elixir
+MyApp.Config.get([:oauth, :client_id], "default")
+MyApp.Config.put([:oauth, :client_id], "test-client")
+```
+
+Paths step through keyword lists and maps, to any depth. A missing key anywhere
+along the way yields the default, exactly as `Application.get_env/3` does for a
+missing top-level key.
+
+Overrides resolve **longest prefix first**: an override on the exact path wins,
+then one on each shorter prefix, then app env. So pinning a whole group still
+works, and a group override is visible to leaf reads:
+
+```elixir
+MyApp.Config.put(:oauth, client_id: "a", secret: "b")
+MyApp.Config.get([:oauth, :client_id])   #=> "a"
+```
+
+It does not work in reverse – overriding a leaf doesn't synthesize a parent, so
+`get(:oauth)` after `put([:oauth, :client_id], …)` returns the unmodified
+app-env group. Override at the level you read at. A one-element path is the
+same key as the bare atom, so `[:port]` and `:port` are interchangeable.
+
+## Build your own
+
+Nothing about `Ambient.Config` or `Ambient.Clock` is privileged – they're both
+`use Ambient.Value`. If your app reads a value from the runtime rather than
+receiving it as an argument, this is the supported way to make it testable:
+
+```elixir
+defmodule MyApp.Flags do
+  use Ambient.Value, table: :my_app_flag_overrides
+
+  @doc "Is `flag` on for `actor`? In production, the real flag-service lookup."
+  def enabled?(flag, actor \\ nil) do
+    get_or({:flag, flag}, FunWithFlags.enabled?(flag, for: actor))
+  end
+
+  @doc "Pin it for this test and everything it spawns."
+  def enable(flag), do: put_override({:flag, flag}, true)
+  def disable(flag), do: put_override({:flag, flag}, false)
+end
+
+Ambient.start_servers([MyApp.Flags])   # in test_helper.exs, like a built-in
+```
+
+```elixir
+test "checkout uses the new pricing path when the flag is on" do
+  MyApp.Flags.enable(:new_pricing)
+
+  assert %{total: 900} = Checkout.quote(cart)   # reads the flag per line item
+end
+```
+
+A flag is the shape this is for: read incidentally several layers down, in
+whatever process happens to be doing the work, with no parameter to thread. And
+the obvious alternative has the problem this library exists to solve –
+`FunWithFlags.enable/1` writes a node-global ETS cache, so one test flipping a
+flag flips it for every concurrent test, which is the `async: false` tax again.
+(On the Ecto adapter with that cache disabled in `:test`, the SQL sandbox
+already isolates it – use that; this is for the setups where it doesn't.) Note
+what stays a parameter: the flag lookup is ambient because nothing threads it,
+but `actor` – who it is evaluated *for* – is an argument and stays one.
+
+Two rules decide whether you have an ambient value at all:
+
+**The fallback must be the real production implementation.** `Clock.utc_now/0`
+falls back to `DateTime.utc_now/0`, a config `get/2` to
+`Application.get_env/3`, `Flags.enabled?/2` to the real lookup. A production
+build doesn't compile the override branch, so **the fallback is all that is
+left**; if it is a stub, production uses that stub forever and what you built is
+a test-only global wearing an app-shaped API.
+
+**Don't make authorization ambient.** The current tenant and the acting user are
+the tempting candidates and the wrong ones: they decide what a request may see,
+so an override that outlives its test is a data-exposure bug rather than a wrong
+timestamp. Thread those – Ash takes an `actor:` option for exactly this reason.
+
+`use Ambient.Value` generates `put_override/2`, `delete_override/1`,
+`delete_all/0`, `overridden?/1`, `allow/2`, `set_shared/1`, `set_private/0` and
+`__ambient_table__/0` – all `defoverridable` – imports the `get_or/2` macro, and
+sets two module attributes: `@ambient_table` (the table you named, for the rare
+direct `Ambient.ProcessOverride` call) and `@ambient_enabled` (whether this
+build compiled the machinery in, for the rare hand-rolled branch – see
+[the compile-time switch](#the-compile-time-switch-and-production-cost)).
+
+`get_or/2` is a macro on purpose: it expands at compile time, so a build without
+overrides keeps only the fallback – `enabled?/2` above compiles to the bare
+`FunWithFlags.enabled?/2` call. The fallback is evaluated only on a miss, so
+`get_or(:key, expensive_call())` doesn't pay for a call it doesn't need.
+
+### When your reads also write
+
+A value can advance when it is read. `Ambient.Clock.set/1` freezes time, which
+is usually what you want – but a frozen clock gives every row the same
+`inserted_at`, so ordering assertions flap. A tick-on-read clock hands back the
+current instant and nudges it forward, with no `Process.sleep/1` anywhere.
+
+For that shape use `Ambient.ProcessOverride.get_and_update/3` rather than a
+`fetch` + `put` pair: it resolves, applies your function and writes back
+atomically, which is what keeps such a module correct under
+[shared mode](#shared-mode-for-async-false-tests), where every process is
+reading and writing the *same* row.
+
+```elixir
+defmodule MyApp.TickingClock do
+  use Ambient.Value, table: :my_app_ticking_clock_overrides
+
+  def set(%DateTime{} = dt), do: put_override(:clock, dt)
+
+  if @ambient_enabled do
+    def utc_now do
+      tick = &{&1, DateTime.add(&1, 1, :millisecond)}
+
+      case Ambient.ProcessOverride.get_and_update(@ambient_table, :clock, tick) do
+        {:ok, dt} -> dt
+        :error -> DateTime.utc_now()
+      end
+    end
+  else
+    def utc_now, do: DateTime.utc_now()
+  end
+end
+```
+
+What shared mode buys here is **distinct** timestamps, not ordered ones: the
+draw is atomic, but which caller wins the race to write its row afterwards is
+still up to the scheduler. Assert distinctness, and sort by the column if you
+need order.
+
+```elixir
+use ExUnit.Case, async: false   # shared mode: one stream for the whole system
+
+test "the audit log gets distinct timestamps across the worker pool" do
+  MyApp.TickingClock.set(~U[2026-01-01 09:00:00Z])
+  Ambient.set_shared(MyApp.TickingClock)
+  on_exit(fn -> Ambient.set_private(MyApp.TickingClock) end)
+
+  1..10 |> Task.async_stream(&Audit.record/1) |> Stream.run()
+
+  stamps = Audit.timestamps()
+  assert stamps == Enum.uniq(stamps)
+end
+```
+
+Your function takes the current value and returns `{result, new_value}`. If it
+raises, the exception surfaces in your process, not the table's server.
+
+Note the `@ambient_enabled` split, which `get_or/2` would have handled for you.
+In a build without overrides `get_and_update/3` raises, so its success typing is
+`none()` and *both* `case` clauses are provably dead – which Elixir 1.19+ reports
+as a warning in **your** module, failing a release built with
+`--warnings-as-errors` (on older versions only Dialyzer catches it). This is the one shape that needs the branch written by
+hand; see [the compile-time switch](#the-compile-time-switch-and-production-cost).
+
+**Mind the fork, which is why that test is `async: false`.** In private mode a
+child inherits the value as it stands at the child's *first read*, then advances
+its own copy – so concurrent siblings repeat the same sequence rather than
+sharing one. Measured on the module above: ten `Task`s in private mode produce
+**one** distinct timestamp between them, which is precisely the collision this
+section set out to fix. The fork is harmless only when a single process does all
+the reading. Any pool, and any value where a repeat is a *bug* (ids, a
+decrementing budget), needs shared mode – and that costs `async: false`.
+
+A seeded RNG looks like a candidate for this and usually isn't: fixture
+generation is single-process, where `:rand.seed/2` needs no ownership, and
+production randomness is usually jitter, where a test wants to pin the *delay*
+rather than replay a stream.
+
+## Clock, the worked example
+
+`Ambient.Clock` ships built in, and is what a `use Ambient.Value` module looks
+like when it's finished. Read time through it and a test can freeze time, or
+travel, without `Process.sleep/1` or hand-rolled date arithmetic:
 
 ```elixir
 # app code – instead of DateTime.utc_now/0, Date.utc_today/0, …
-Ambient.Clock.utc_now()
-Ambient.Clock.utc_today()
-Ambient.Clock.naive_utc_now()
-Ambient.Clock.now("Europe/Warsaw")   # needs a configured time zone database
+MyApp.Clock.utc_now()
+MyApp.Clock.utc_today()
+MyApp.Clock.naive_utc_now()
+MyApp.Clock.now("Europe/Warsaw")   # needs a configured time zone database
 
 # tests
-Ambient.Clock.set(~U[2026-01-01 09:00:00Z])
-Ambient.Clock.advance(days: 1)     # also :hours, :minutes, :seconds, or a bare int
-Ambient.Clock.advance(hours: 1, minutes: 30)   # units are summed
-Ambient.Clock.advance(-90)         # backwards, in seconds
-Ambient.Clock.reset()
+MyApp.Clock.set(~U[2026-01-01 09:00:00Z])
+MyApp.Clock.advance(days: 1)     # also :hours, :minutes, :seconds, or a bare int
+MyApp.Clock.advance(hours: 1, minutes: 30)   # units are summed
+MyApp.Clock.advance(-90)         # backwards, in seconds
+MyApp.Clock.reset()
 ```
 
 ```elixir
 test "a token expires after 24 hours" do
-  Ambient.Clock.set(~U[2026-01-01 09:00:00Z])
+  MyApp.Clock.set(~U[2026-01-01 09:00:00Z])
   token = Tokens.issue(user)
 
-  Ambient.Clock.advance(hours: 23)
+  MyApp.Clock.advance(hours: 23)
   assert Tokens.valid?(token)
 
-  Ambient.Clock.advance(hours: 2)
+  MyApp.Clock.advance(hours: 2)
   refute Tokens.valid?(token)
 end
 ```
 
 `set/1` and `advance/1` return the new time, so they compose into assertions.
 
-### Random
+## Wrap it in your own namespace
+
+Adopting Ambient otherwise means a third-party module name at every clock read
+in your application code – and backing out would mean touching all of them. So
+define your own module and call that everywhere. The dependency is then named
+in exactly two modules of your application code – plus `mix.exs`,
+`config/config.exs` and `test/test_helper.exs`:
 
 ```elixir
-# app code
-Ambient.Random.uniform(100)        # 1..100
-Ambient.Random.uniform()           # float in [0.0, 1.0)
-Ambient.Random.normal(0.0, 1.0)
-Ambient.Random.shuffle(cards)
-Ambient.Random.take_random(deck, 5)
-Ambient.Random.bytes(32)
-
-# tests – same seed replays the same stream every run
-Ambient.Random.seed(42)
-first = Ambient.Random.uniform(100)
-Ambient.Random.seed(42)
-assert Ambient.Random.uniform(100) == first
-```
-
-Repeated calls in one process advance the stream, so four `shuffle/1` calls
-give four different permutations – the same four every run.
-
-Across processes it's a **fork**, not one shared stream: a child inherits the
-owner's state as of the seed and advances its own copy. Sequential work is
-unsurprising (a child that draws after the parent continues where the parent
-left off), but **concurrent siblings each get the same values**:
-
-```elixir
-Ambient.Random.seed(42)
-1..4 |> Enum.map(fn _ -> Task.async(fn -> Ambient.Random.bytes(4) end) end)
-     |> Task.await_many()
-#=> four identical tokens
-```
-
-That is deliberate, and it's the only way to be reproducible: which sibling
-gets which value from a single stream depends on scheduling, so *distinct* and
-*reproducible* cannot both hold across concurrent processes. Pick one:
-
-| You want | Use | Cost |
-|---|---|---|
-| Reproducible run to run | `seed/1` (default) | concurrent siblings share values |
-| Distinct values everywhere | `seed/1` + [shared mode](#shared-mode-for-async-false-tests) | ordering isn't reproducible; `async: false` |
-| Distinct *and* reproducible per worker | `seed/1` inside each worker, with its own seed | you choose the seeds |
-
-Shared mode routes every draw through one atomically-advanced stream, so
-concurrent callers never collide.
-
-#### Cryptography
-
-Seedable and unpredictable are opposites, so the rule is per-function, not
-per-module:
-
-| | No seed in scope | Under `seed/1` |
-|---|---|---|
-| `bytes/1` | `:crypto.strong_rand_bytes/1` – **credential-safe** | deterministic, not safe |
-| `uniform`, `normal`, `shuffle`, `random`, `take_random` | `:rand` (`exsss`) – **never** credential-grade | deterministic |
-
-```elixir
-# fine – strong in production, replayable in tests
-Ambient.Random.bytes(32) |> Base.url_encode64(padding: false)
-
-# never – a token is not a dice roll
-Enum.map(1..32, fn _ -> Ambient.Random.uniform(256) end)
-```
-
-The right-hand column can't happen in production, because the
-[compile-time switch](#the-compile-time-switch) doesn't compile the seeded
-clause at all – there is no code path from a seed to `bytes/1` to reach, no
-matter what a `$callers` chain, an `allow/3` grant, a seeds script or a remote
-console does. That holds only if you derive the flag from `config_env/0`; a
-build that hard-codes it on has ordinary seeded bytes, and warns at compile
-time when Ambient can tell it's a prod build.
-
-### Env
-
-`System.put_env/2` mutates the whole VM: two `async: true` tests setting the
-same variable clobber each other, and a leaked value survives into every later
-test in the run.
-
-```elixir
-# app code – instead of System.get_env/1
-Ambient.Env.get("DATABASE_URL")
-Ambient.Env.get("PORT", "4000")
-Ambient.Env.fetch!("SECRET_KEY_BASE")
-
-# tests
-Ambient.Env.put("FEATURE_X", "true")
-Ambient.Env.put_all(%{"REGION" => "eu-west-1", "TIER" => "premium"})
-Ambient.Env.unset("HOME")      # override it as absent, even though it really is set
-Ambient.Env.revert("HOME")     # drop the override, see the real value again
-Ambient.Env.reset()            # drop every override this process set
-```
-
-`unset/1` and `revert/1` are deliberately different: `unset/1` *writes* an
-override meaning "absent", which is how you test that path for a variable that
-really is set; `revert/1` removes an override.
-
-> **Runtime reads only.** An override can only affect a read that happens while
-> it is in scope. Anything resolved at boot (`config/runtime.exs`) or at compile
-> time has already been read. Wrap the read in a function your code calls when
-> it needs the value.
-
-## Build your own
-
-Nothing about the built-ins is privileged – they're all `use Ambient.Value`.
-If your app has an ambient value of its own (the current tenant, the acting
-user, a request id), this is the supported way to make it as testable:
-
-```elixir
-defmodule MyApp.Tenant do
-  use Ambient.Value, table: :my_app_tenant_overrides
-
-  def current, do: get_or(:tenant, MyApp.Tenant.Default)
-  def put(tenant), do: put_override(:tenant, tenant)
+defmodule MyApp.Config do
+  use Ambient.Config, otp_app: :my_app
 end
 
-Ambient.start_servers([MyApp.Tenant])   # in test_helper.exs, like a built-in
-```
-
-A module wrapping a specific domain usually adds its own verbs on top – a
-generated config's `put/2`, `Clock.set/1`, `Random.seed/1`, `Env.put/2` – and
-leaves the generic layer below for everything else.
-
-`use Ambient.Value` generates `put_override/2`, `delete_override/1`,
-`delete_all/0`, `overridden?/1`, `allow/2`, `set_shared/1`, `set_private/0` and
-`__ambient_table__/0` – all `defoverridable` – and imports the `get_or/2` macro.
-If your reads also *write* (as `Ambient.Random` does, advancing its seed), write
-back with `ProcessOverride.put_resolved/3` so it keeps working under shared
-mode.
-
-`get_or/2` is a macro on purpose: it expands at compile time, so in a build
-without overrides the lookup disappears entirely and only the fallback
-expression remains. `def current, do: get_or(:tenant, MyApp.Tenant.Default)`
-compiles to `def current, do: MyApp.Tenant.Default`. The fallback is evaluated
-only on a miss, so `get_or(:key, expensive_call())` doesn't pay for a call it
-doesn't need.
-
-## Re-exporting under your own namespace
-
-Prefer to call `MyApp.Clock` instead of `Ambient.Clock` across your app? Wrap a
-value module with `Ambient.Facade` – the delegates are derived at compile time,
-so the wrapper never drifts when the wrapped module gains a function:
-
-```elixir
 defmodule MyApp.Clock do
   use Ambient.Facade, for: Ambient.Clock
 end
-
-MyApp.Clock.set(~U[2026-01-01 00:00:00Z])   # delegates to Ambient.Clock
 ```
+
+The delegates are derived at compile time, so a wrapper never drifts when the
+wrapped module gains a function, and `Ambient.start_servers/1`, `set_shared/2`
+and `set_private/1` all accept your wrapper rather than the module behind it.
 
 Narrow the surface with `:only` / `:except` (names or `{name, arity}` pairs):
 
 ```elixir
-use Ambient.Facade, for: Ambient.Clock, only: [:utc_now, :utc_today]
-use Ambient.Facade, for: Ambient.Random, except: [:seed]
+use Ambient.Facade, for: Ambient.Clock, except: [:now, :naive_utc_now]
 ```
+
+The rest of this README uses `MyApp.*` on that assumption. Calling
+`Ambient.Clock` directly works identically – you just spread the dependency
+across your call sites.
 
 ## Reaching a process you didn't spawn
 
-Plain `Task.async`/`Agent` children inherit automatically via `$callers`. For a
-long-lived process the test didn't spawn (a named GenServer, an Oban worker),
-authorise it explicitly – the same pattern as `Ecto.Adapters.SQL.Sandbox.allow/3`:
-
-```
-   test process  ──put/set/seed──▶  ETS override
-        │
-        ├── Task.async child ──────▶ inherits via $callers   (no setup)
-        │
-        └── Ambient.Clock.allow(worker_pid)
-                     │
-              worker_pid ──────────▶ inherits via allow chain
-```
+`Task` children inherit automatically via `$callers` – that includes
+`Task.async/1`, `Task.async_stream/3` and `Task.Supervisor.async/2`. **`Agent`
+and `GenServer` do not**: only `Task` sets `$callers`, so an `Agent.start_link/2`
+child reads the real clock unless you grant it access. For those, and for a
+long-lived process the test didn't spawn – a supervised GenServer, a LiveView –
+authorise it explicitly, the same pattern as `Ecto.Adapters.SQL.Sandbox.allow/3`:
 
 ```elixir
-Ambient.Clock.allow(worker_pid)
-Ambient.Random.allow(worker_pid)
-Ambient.Env.allow(worker_pid)
-MyApp.Config.allow(genserver_pid)
+setup do
+  pid = start_supervised!(MyApp.Scheduler)
+
+  MyApp.Clock.set(~U[2026-01-01 09:00:00Z])
+  MyApp.Clock.allow(pid)      # every read from here on sees the test's clock
+
+  %{scheduler: pid}
+end
 ```
 
-Grants chain: if A allows B and B allows C, C resolves through to A. Cycles
-terminate rather than spinning.
+> **`allow/2` starts when you call it.** A supervised process has `$ancestors`
+> but no `$callers`, so it inherits nothing implicitly – and you can't grant it
+> access until `start_supervised!/1` has returned a pid, by which point its
+> `init/1` has already run. Anything the process reads while starting up gets
+> the real clock, whichever order you write these two lines in. If that matters,
+> take the table [shared](#shared-mode-for-async-false-tests) before starting
+> the process, or design the process so its first read happens on a tick the
+> test triggers. `Ecto.Adapters.SQL.Sandbox` has the same boundary.
+
+
+Every value module has it, and it takes any pid you can get hold of – a
+`start_supervised!/1` return, `Process.whereis/1` for a named server, a
+LiveView's `view.pid`. Grants chain: if A allows B and B allows C, C resolves
+through to A. Cycles terminate rather than spinning, and still fall through to
+`$callers`.
+
+> **Background jobs often don't need this.** Oban's test helpers run the job in
+> the calling process – `perform_job/2` invokes `perform/1` directly,
+> `testing: :inline` executes "immediately within the calling process", and
+> `Oban.drain_queue/2` runs everything in the current process. On those paths a
+> worker already sees the test's overrides with no setup. `allow/3` is for a
+> live queue in an integration test, where a real producer process runs the job.
 
 ## Shared mode (for `async: false` tests)
 
@@ -418,16 +435,16 @@ reads:
 use ExUnit.Case, async: false   # required – this is global state
 
 test "the whole system sees the frozen clock" do
-  Ambient.Clock.set(~U[2026-01-01 09:00:00Z])
-  Ambient.set_shared(Ambient.Clock)
-  on_exit(fn -> Ambient.set_private(Ambient.Clock) end)
+  MyApp.Clock.set(~U[2026-01-01 09:00:00Z])
+  Ambient.set_shared(MyApp.Clock)
+  on_exit(fn -> Ambient.set_private(MyApp.Clock) end)
 
   # any process, however spawned, now reads that clock
 end
 ```
 
 `Ambient.start_servers/1`, `set_shared/2` and `set_private/1` all take one
-value module or a list of them.
+value module (or facade) or a list of them.
 
 Same rule as `Ecto.Adapters.SQL.Sandbox`'s shared mode and `Mox.set_mox_global/0`:
 **never in an `async: true` test**, or a concurrent test will see your clock.
@@ -437,161 +454,23 @@ While a table is shared:
 - only the shared owner may write – `put/3` and `set_shared/2` from anyone else
   raise `{:not_shared_owner, pid}`, so another test can't silently steal the
   table;
+- `get_and_update/3` is the deliberate exception, so read-modify-write modules
+  keep working atomically from every process;
 - `allow/3` is refused, since every process already reads the owner's values;
 - `set_private/1` is deliberately open to any process – it's the way back to a
   sane state, and `on_exit/1` runs in a different process from the test;
 - `delete/2` and `reset/0`-style teardown stay scoped to the caller's own rows,
-  so a non-owner's `Clock.reset()` doesn't (and can't) clear the shared value;
+  so a non-owner's `MyApp.Clock.reset()` doesn't (and can't) clear the shared
+  value;
 - the owner is monitored, so a crashed test drops the table back to private on
-  its own rather than leaving the suite globally overridden.
+  its own rather than leaving the suite globally overridden. Keep the `on_exit`
+  anyway: that `:DOWN` is handled asynchronously, so the *next* test's
+  `set_shared/2` can still arrive first and raise `{:not_shared_owner, pid}`
+  against a pid that is already gone.
 
-`Ambient.ProcessOverride.mode/1` reports `:private` or `{:shared, pid}`.
-
-## Errors
-
-Every Ambient misuse raises `Ambient.Error` with a machine-readable `:reason`
-(`:overrides_disabled`, `:server_not_started`, `{:not_shared_owner, pid}`,
-`:cant_allow_in_shared_mode`, `:not_a_value_module`, `{:server_start_failed, reason}`).
-Match on `:reason`, not on message text:
-
-```elixir
-rescue
-  e in Ambient.Error ->
-    case e.reason do
-      :server_not_started -> start_and_retry()
-      _ -> reraise(e, __STACKTRACE__)
-    end
-end
-```
-
-Bad *argument values* (`Ambient.Clock.advance(weeks: 1)`) still raise
-`ArgumentError` – `Ambient.Error` means Ambient is in the wrong state, not that
-you passed the wrong term.
-
-## The compile-time switch
-
-Every override path is gated on one flag, resolved at compile time via
-`Application.compile_env/3`:
-
-```elixir
-# config/config.exs
-config :ambient, enable_overrides: config_env() != :prod
-```
-
-Default `false`. In a build that didn't opt in, no Ambient API can produce an
-override:
-
-- `Ambient.start_servers/1`, `ProcessOverride.Server.start_link/1` and
-  `Server.init/1` all refuse to create the ETS table;
-- `put/3`, `allow/3`, `set_shared/2` raise, as do the built-ins' writers
-  (`Clock.set/1`, `Random.seed/1`, `Env.put/2`, `put_override/2`, …);
-- the built-ins' override branches aren't compiled at all – see
-  [Production cost](#production-cost);
-- `reset/0`-style teardown stays a safe no-op, so `on_exit` helpers don't need
-  guarding.
-
-What it deliberately does **not** do: `ProcessOverride.fetch/2` keeps its ETS
-lookup in disabled builds, because a clause hard-wired to `:error` makes every
-caller's `{:ok, _}` branch provably dead and consumers compiling with
-`--warnings-as-errors` would fail on it. So a hand-rolled
-`:ets.new(:ambient_clock_overrides, [:named_table, :public])` plus a row *is*
-visible to `fetch/2`, `mode/1` and `overridden?/1`. It is **not** visible to
-the built-ins' actual reads – `get_or/2` compiled those away, so
-`Clock.utc_now/0` and a generated `MyApp.Config.get/2` ignore it. Forging one needs arbitrary
-code execution inside the node anyway.
-
-Three more things worth knowing:
-
-- Derive the flag from `config_env/0`. Compiling Ambient with it hard-coded on
-  warns whenever Ambient can tell it's building for `:prod` – such a release
-  carries the machinery and `bytes/1` loses its guarantee. Ambient sees only
-  `MIX_ENV` and the build directory, so a project with
-  `build_per_environment: false` gets no warning; derive the flag and the
-  question doesn't arise.
-- Mix records the value in the app manifest, so a **release** whose runtime
-  config disagrees aborts at boot rather than drifting. (A `mix run` in `:prod`
-  does not perform that check.)
-- It's resolved per `_build` env. Build releases with `MIX_ENV=prod`; a release
-  built with `MIX_ENV=test` would carry the machinery.
-
-`Ambient.ProcessOverride.enabled?/0` reports the current build. Use it in a
-module body: its value is fixed when Ambient compiles, so a runtime branch on
-it is just dead code.
-
-### Dialyzer
-
-Gate the flag on `config_env() != :prod`, not `== :test`.
-
-In a build without overrides the writers raise, so their success typing is
-`none()` – and `dialyxir` runs in `:dev` by default, so gating on `== :test`
-points Dialyzer at exactly that build. Ambient's generated specs say
-`no_return()` there, which keeps the generated code itself clean, but a
-function of *yours* that wraps a writer still can't return:
-
-```elixir
-def put(tenant), do: put_override(:tenant, tenant)
-# warning: Function put/1 has no local return
-```
-
-That is Dialyzer being right. Measured on a small consuming app with one
-`use Ambient.Config` and one `use Ambient.Value`:
-
-| `enable_overrides` | Warnings in the consumer's own modules |
-|---|---|
-| `config_env() != :prod` | **0** |
-| `config_env() == :test` | **1** – the wrapper above |
-
-So gate on `!= :prod` and the question doesn't arise. If you'd rather keep
-`== :test`, move such wrappers behind `if Ambient.ProcessOverride.enabled?()`,
-which compiles them out of the build that can't run them anyway.
-
-## Production cost
-
-None worth measuring. `get_or/2` expands to the fallback expression alone, so
-each wrapper compiles down to the function it wraps:
-
-| Wrapper | Production build compiles to |
-|---|---|
-| `Ambient.Clock.utc_now/0` | `DateTime.utc_now/0` |
-| `Ambient.Random.bytes/1` | `:crypto.strong_rand_bytes/1` |
-| `Ambient.Random.uniform/1` | `:rand.uniform/1` |
-| `Ambient.Env.get/2` | `System.get_env/2` |
-| `MyApp.Config.get/2` | `Application.get_env/3` |
-
-No ETS lookup, no branch, no message round-trip. `Ambient.ProcessOverride`'s
-own `fetch/2` still costs one `:ets.whereis/1`, but the built-ins don't call it
-in a disabled build.
-
-## Enforcing the conventions (optional Credo checks)
-
-Ambient ships four Credo checks that keep direct clock/RNG/env/config reads from
-sneaking back in. **They're opt-in**: `credo` is an *optional* dependency, so if
-you don't use Credo you pull nothing and the checks aren't even compiled. If you
-do, enable them in `.credo.exs`:
-
-```elixir
-checks: %{
-  extra: [
-    {Ambient.Credo.NoDirectClock, []},
-    {Ambient.Credo.NoDirectRandom, []},
-    {Ambient.Credo.NoDirectEnv, exempt_suffixes: ["config/runtime.exs"]},
-    {Ambient.Credo.NoDirectConfig, otp_app: :my_app, replacement: "MyApp.Config"}
-  ]
-}
-```
-
-- `NoDirectClock` flags `DateTime.utc_now/0` & friends; `NoDirectRandom` flags
-  `:rand.*` / `Enum.shuffle|random|take_random` (but allows
-  `:crypto.strong_rand_bytes/1`); `NoDirectEnv` flags `System.get_env/*` and
-  `System.put_env/*`; `NoDirectConfig` flags runtime
-  `Application.get_env(:my_app, …)`.
-- All take `replacement:` (the wrapper name shown in the message) and
-  `exempt_suffixes:` (paths to skip). So if you re-export under your own
-  namespace, point them at it:
-
-  ```elixir
-  {Ambient.Credo.NoDirectClock, replacement: "MyApp.Clock", exempt_suffixes: ["lib/my_app/clock.ex"]}
-  ```
+`Ambient.mode/1` reports `:private` or `{:shared, pid}`, and takes a value
+module like everything else here. (`Ambient.ProcessOverride.mode/1` is the same
+query against a raw table atom.)
 
 ## How it works
 
@@ -603,28 +482,296 @@ rows (and any `allow` rows pointing at it) on exit – so concurrent `async: tru
 tests never see each other's values and nothing leaks.
 
 Reads are plain ETS lookups in the calling process: no GenServer call, no
-serialization point between concurrent tests.
+serialization point between concurrent tests. Writes do go through the server,
+which is what lets a monitor and a row be established together rather than
+racing an exit in the gap.
+
+## The compile-time switch and production cost
+
+Every override path is gated on one flag, resolved at compile time via
+`Application.compile_env/3`:
+
+```elixir
+# config/config.exs
+config :ambient, enable_overrides: config_env() != :prod
+```
+
+Default `false`. In a build that didn't opt in no override can exist: the ETS
+table can't be created, every writer raises, and the override branches aren't
+compiled at all. `reset/0`, `revert/1` and the other *deletes* stay safe no-ops,
+so ordinary `on_exit` teardown needs no guarding – but `set_private/1` is a
+writer and raises like the rest, so an `on_exit` that leaves shared mode belongs
+in a test that could only run in a build with overrides anyway.
+
+### What it costs in production
+
+Nothing worth measuring. `get_or/2` expands to the fallback expression alone,
+so each wrapper compiles to a direct call to the function it wraps:
+
+| Wrapper | Production build compiles to |
+|---|---|
+| `MyApp.Config.get/2` | `Application.get_env/3` |
+| `MyApp.Config.fetch/1` | `Application.fetch_env/2` |
+| `Ambient.Clock.utc_now/0` | `DateTime.utc_now/0` |
+| `MyApp.Flags.enabled?/2` | its fallback expression |
+
+No ETS lookup, no branch, no message round-trip. Nested config paths are
+resolved straight out of app env with no lookup either. A
+[facade](#wrap-it-in-your-own-namespace) adds one `defdelegate` hop on top –
+a direct remote call, not a lookup.
+
+### Two gotchas
+
+- **Build releases with `MIX_ENV=prod`.** The flag resolves per `_build` env, so
+  a release built with `MIX_ENV=test` carries the machinery. Mix records the
+  value in the app manifest, so a release whose runtime config disagrees aborts
+  at boot rather than drifting silently.
+- **Hard-coding the flag `true` warns** whenever Ambient can tell it's building
+  for `:prod`. Derive it from `config_env/0` and the question doesn't arise.
+
+`Ambient.ProcessOverride.enabled?/0` reports the current build.
+[Its moduledoc](https://hexdocs.pm/ambient/Ambient.ProcessOverride.html) covers
+the rest: what the switch deliberately leaves in place and why, and what
+Dialyzer does with a disabled build.
+
+## Enforcing the conventions (optional Credo checks)
+
+Ambient ships two Credo checks that keep direct config and clock reads from
+sneaking back in. **They're opt-in**: `credo` is an *optional* dependency, so if
+you don't use Credo you pull nothing and the checks aren't even compiled. If you
+do, enable them in `.credo.exs`:
+
+```elixir
+checks: %{
+  extra: [
+    {Ambient.Credo.NoDirectConfig, otp_app: :my_app, replacement: "MyApp.Config"},
+    {Ambient.Credo.NoDirectClock, replacement: "MyApp.Clock"}
+  ]
+}
+```
+
+`replacement:` is the module name shown in the message, and defaults to
+`Ambient.Clock` – so set it to
+[your own wrapper](#wrap-it-in-your-own-namespace) or Credo will tell people to
+call a module your codebase deliberately doesn't.
+
+`NoDirectConfig` flags runtime `Application.get_env|fetch_env|fetch_env!` for
+your app, including the `@otp_app` attribute spelling and piped forms;
+`NoDirectClock` flags `DateTime.utc_now/0` & friends and the `:os`/`:erlang`
+time primitives, in call and capture forms. Both take `exempt_suffixes:`, a
+list of path suffixes to skip.
+
+**Exempt your own wrappers.** `NoDirectClock` bans `DateTime.utc_now/0`
+wherever it appears, and a `use Ambient.Value` module whose fallback is the real
+clock (like `MyApp.TickingClock` above) *is* such a call site. Add those files to
+`exempt_suffixes:` alongside your facade, or the check will tell them to call
+themselves.
+
+**A known gap:** the checks match module names as written. A call reached
+through an alias (`alias DateTime, as: DT`) or `apply/3` is invisible to them.
+In practice the banned calls are written literally; if you rely on the checks
+as a hard gate, know that they are a strong convention enforcer rather than a
+proof.
+
+## Errors
+
+Misuse raises `Ambient.Error` with a machine-readable `:reason`
+(`:overrides_disabled`, `:server_not_started`, `{:not_shared_owner, pid}`,
+`:cant_allow_in_shared_mode`, `:not_a_value_module`,
+`{:server_start_failed, reason}`) – match on `:reason`, not on message text. A
+bad *argument value* (`MyApp.Clock.advance(weeks: 1)`) raises `ArgumentError`
+instead: `Ambient.Error` means Ambient is in the wrong state, not that you
+passed the wrong term. See [`Ambient.Error`](https://hexdocs.pm/ambient/Ambient.Error.html).
+
+# Why, and when not to
+
+That's the whole surface. The rest of this page is the argument for it, the
+cases against, and what adopting it costs.
+
+## Why config
+
+`Application.put_env/3` is VM-global. A test that overrides a setting can't be
+`async: true`, and that isn't a rare shape: in the app this library was built
+for, **17 config keys are read by two or more concurrent test files** – one of
+them by six. Every one of those files would have to be serialised, or paired
+with `setup`/`on_exit` restore logic that a crash can still leak past.
+
+Unlike a clock, there is no fake to write here. `Application.get_env/3`
+is a keyed lookup, not a contract you can swap: a per-test config layer *is* an
+ownership problem. The obvious places to keep that state give you one property
+or the other, never both:
+
+| Where the value lives | Isolated per test | Reachable from another process |
+|---|---|---|
+| compile-time DI (`@clock` attribute) | ❌ one implementation per build | ✅ needs no parameter |
+| a threaded value or fake | ✅ | ❌ needs a parameter at every hop |
+| `Process.put/2` | ✅ | ❌ lost at the boundary |
+| `Application.put_env/3` | ❌ VM-global | ✅ |
+| **ETS keyed by owner + `$callers` + monitors** | ✅ | ✅ |
+
+Only the last row gets both, and it isn't a novel idea – it's what
+[`Ecto.Adapters.SQL.Sandbox`](https://hexdocs.pm/ecto_sql/Ecto.Adapters.SQL.Sandbox.html)
+does for database connections. Its ownership manager keeps a protected,
+read-concurrent ETS table keyed by owner pid, and resolves a checkout
+client-side by walking `[caller | Process.get(:"$callers")]` against it, so a
+hit needs no GenServer at all. Threading a `conn` through every function is
+possible and nobody does it, so Ecto pays for an ownership mechanism instead.
+Ambient is the same mechanism for arbitrary values, plus a compile-time switch
+that keeps it out of your release.
+
+**Pass the value when you can.** A parameter beats an ambient read every time,
+and a closure captures across a process boundary perfectly well:
+
+```elixir
+now = MyApp.Clock.utc_now()
+Task.async(fn -> Billing.charge(invoice, now) end)
+```
+
+This library is for the reads where there is no parameter to pass – config
+being the clearest case, and these being the others:
+
+**The call site isn't yours.** Ecto generates timestamps from an MFA it invokes
+itself, with arguments it chose:
+
+```elixir
+# in MyApp.Clock, alongside `use Ambient.Facade, for: Ambient.Clock`
+def naive_second, do: naive_utc_now() |> NaiveDateTime.truncate(:second)
+
+# in the schema
+@timestamps_opts [autogenerate: {MyApp.Clock, :naive_second, []}]
+```
+
+The truncation is not incidental: Ecto's default timestamp type is
+`:naive_datetime`, which **raises** on a value carrying microseconds
+(`Ecto.Type.check_no_usec!/2`), and `naive_utc_now/0` has them – Ecto's own
+`__timestamps__/1` truncates for the same reason. Pass
+`type: :utc_datetime_usec` and you can hand it `utc_now` directly instead.
+
+Same shape for changeset autogeneration, Phoenix plugs, Absinthe middleware,
+telemetry handlers.
+
+**The process isn't in your spawn tree.** A GenServer started by the app
+supervisor and ticking on `handle_info(:tick)`; a LiveView Phoenix spawned; a
+live Oban queue in an integration test. No closure to capture into – and
+launch-time dependency injection doesn't reach these either, because the test
+didn't launch them.
+
+## Should you use this?
+
+**Don't bother if:**
+
+- **Your tests don't spawn, and you only need a clock.** A small
+  `Process.put/2` fake picked with `Application.compile_env/3` is per-test
+  isolated, `async: true`-safe, and costs you no dependency at all.
+- **You can pass the value.** Do that instead.
+- **You're comfortable patching modules.** [Repatch](https://hexdocs.pm/repatch)
+  reaches `DateTime`, `System`, `Application` and `:rand` directly – no
+  wrapper, no call-site change, no production dependency, same per-process
+  ownership model. Lower adoption cost than this library. See
+  [How it compares](#how-it-compares).
+
+**Reach for it if:**
+
+- **`Application.put_env/3` is why part of your suite is `async: false`.** This
+  is the strongest case, because it's the one with no cheaper answer.
+  `MyApp.Config.put(:key, value)` is the whole API, and it takes
+  [nested keys](#nested-keys), which is how real config is written.
+- **You want the seam explicit.** The wrapper is real API: greppable,
+  documented, [enforceable by Credo](#enforcing-the-conventions-optional-credo-checks),
+  and no module you don't own gets rewritten.
+- **You have ambient values of your own** – a feature flag, a locale, anything
+  read incidentally several layers down that nothing threads to the call site,
+  and whose being wrong is a wrong *result* rather than a security boundary.
+  [`use Ambient.Value`](#build-your-own) gives them the same machinery in about
+  ten lines each.
+
+**Two things Ambient doesn't do.** It can't touch a dependency that calls
+`DateTime.utc_now/0` in its own internals – Ambient only redirects reads that go
+through an Ambient wrapper, and you can't add a wrapper to code you don't own.
+And there's no `verify_on_exit!`: forget `Clock.set/1` and the test quietly
+reads the real clock instead of failing loudly the way an unstubbed Mox call
+would.
+
+## What it costs to adopt
+
+Honestly: Ambient asks you to change every read site, which puts it on the
+dependency-injection side of the "easy to retrofit" line, not the mocking side.
+The defence is that the change is **mechanical rather than structural** – swap
+`Application.get_env(:my_app, :k)` for `MyApp.Config.get(:k)`, keep the
+signature, keep the call graph, and let Credo hold the line – where introducing
+launch-time DI means rewiring how components are started.
+
+What that migration doesn't reach, in a codebase of any age:
+
+- anything read via `Application.compile_env/3`, which resolves at compile time,
+  and any decision made *during* `config/runtime.exs` itself (`if
+  System.get_env("X"), do: config :app, impl: Real`) – both happen before an
+  override can exist. Values that `runtime.exs` merely *writes* into app env are
+  fine: a read through `MyApp.Config.get/2` overrides them like any other;
+- timestamps generated by the database (`fragment("now()")`);
+- a dependency's own internal `DateTime.utc_now/0`;
+- calls the [Credo checks can't see](#enforcing-the-conventions-optional-credo-checks).
+
+So you get a codebase where some reads are overridable and some aren't, and no
+compiler help telling them apart. That's a real cost. It's worth paying when
+`async: false` is costing you more.
 
 ## How it compares
 
-- **[nimble_ownership](https://github.com/dashbitco/nimble_ownership)**
-  ([docs](https://hexdocs.pm/nimble_ownership)) solves the same
-  ownership/allowance problem, and is what Mox is built on. It keeps state in a
-  GenServer, so every read is a `GenServer.call`, and it offers shared mode,
-  lazy allowances and manual cleanup. Ambient reads from public ETS instead,
-  and adds what `nimble_ownership` deliberately doesn't: the built-ins, the
-  Facade, the Credo checks, and the compile-time switch that makes wrappers
-  free in production.
-- **[Mox](https://github.com/dashbitco/mox)**
-  ([docs](https://hexdocs.pm/mox)) overrides *behaviour* (what a module does).
-  Ambient overrides *values* (what a function reads). They're complementary,
-  and Ambient deliberately stays out of mocking.
+### The patch-based libraries – the closest alternatives
+
+**[Repatch](https://hexdocs.pm/repatch)** patches "any function or macro, Elixir
+or Erlang, private or public (except BIF/NIF)", with three modes – `:local`,
+`:shared` (the setting process, its spawned tasks and processes passed to
+`Repatch.allow/3`, chainable) and `:global`. So it reaches `DateTime.utc_now/0`,
+`Application.get_env/3` and `:rand` directly, with the same ownership story
+Ambient has, **no wrapper module, no call-site change, no production dependency**
+and one `Repatch.setup()` line.
+
+**[Mimic](https://hexdocs.pm/mimic)** is the same idea, narrower: private mode
+by default, `Task` processes auto-allowed, `Mimic.copy/1` called from
+`test_helper.exs` so nothing touches production, global mode for `async: false`.
+
+**[Patch](https://hexdocs.pm/patch)** is the older, ergonomic one, and the
+exception: it recompiles modules and so "alters the global execution
+environment", which is why its own docs state "Patch is not compatible with
+`async: true`". Convenient, but it takes concurrency off the table.
+
+Where Ambient differs:
+
+| | Patch-based (Repatch / Mimic) | Ambient |
+|---|---|---|
+| Call sites change | no | yes – you call a wrapper |
+| Reaches a dependency's internal `DateTime.utc_now/0` | ✅ | ❌ |
+| Seam visible at the call site | no | yes |
+| Rewrites modules you don't own | yes | no |
+| Keyed and nested config overrides | patch `get_env/3` with a fallthrough clause per key | first-class |
+
+That last row is the reason this library exists. The rest is taste.
+
+### Mox
+
+[Mox](https://hexdocs.pm/mox) overrides *behaviour* (what a collaborator does)
+against an explicit contract, and is the right tool for that. It's an awkward
+fit for a value read incidentally several layers down: every test that
+transitively touches the clock has to declare it or hit
+`Mox.UnexpectedCallError`, and hoisting a `stub` into a global `setup` is this
+library with more steps. Mox and Ambient are complementary – Ambient stays out
+of mocking.
+
+### The ownership plumbing
+
+- **[nimble_ownership](https://github.com/dashbitco/nimble_ownership)** solves
+  the same ownership problem, is by Dashbit, and is what Mox is built on – the
+  more focused choice if the plumbing is all you need. It keeps state in a
+  GenServer rather than public ETS, and caller inheritance isn't implicit: its
+  docs note the server "does not consider the direct and indirect 'children' of
+  a PID", so you pass `Process.get(:"$callers", [])` yourself. Ambient walks
+  that chain for you, then adds the config layer, the Facade, the Credo checks
+  and the compile-time switch.
 - **[Ecto.Adapters.SQL.Sandbox](https://hexdocs.pm/ecto_sql/Ecto.Adapters.SQL.Sandbox.html)**
-  is the direct inspiration for `allow/3` and shared mode.
-- **[Application.put_env/3](https://hexdocs.pm/elixir/Application.html#put_env/4)**
-  and **[System.put_env/2](https://hexdocs.pm/elixir/System.html#put_env/2)**
-  are what `Ambient.Config` and `Ambient.Env` exist to replace in tests: both
-  are VM-global, so neither is safe under `async: true`.
+  is the direct inspiration for `allow/3` and shared mode, and the precedent for
+  the whole approach.
 
 ## License
 

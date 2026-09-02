@@ -4,25 +4,24 @@ defmodule Ambient do
 
   An *ambient value* is one resolved implicitly from the surrounding context
   rather than threaded through arguments. `Ambient` lets a test set such a
-  value (the current time, a random seed, a config entry) scoped to its process
+  value (a config entry, the current time) scoped to its process
   **and everything that process spawns**, with zero leakage across concurrent
   `async: true` tests and automatic cleanup on exit.
 
   ## Built-in values
 
-    * `Ambient.Clock`  – an overridable wall clock (freeze / travel time)
-    * `Ambient.Random` – a seedable, replayable random number generator
-    * `Ambient.Env`    – overridable OS environment variables
     * `Ambient.Config` – an app-config accessor with a per-process override layer
+    * `Ambient.Clock`  – an overridable wall clock (freeze / travel time)
 
-  All four sit on `Ambient.ProcessOverride`, the shared engine (ETS +
+  Both sit on `Ambient.ProcessOverride`, the shared engine (ETS +
   `$callers` inheritance + an Ecto-Sandbox-style `allow/3`), and are assembled
   with `Ambient.Value` – which you can `use` to build overridable values of
   your own.
 
   ## Reaching other processes
 
-  `Task`/`Agent` children inherit through `$callers` with no setup. For a
+  `Task` children inherit through `$callers` with no setup – `Agent` and
+  `GenServer` do not set it, so they need `allow/2`. For a
   long-lived process the test didn't spawn, grant it explicitly with the
   module's `allow/2`. When you can't reach the process at all, `set_shared/2`
   makes one process's overrides global for the duration of an `async: false`
@@ -38,13 +37,12 @@ defmodule Ambient do
   Then start one override server per table before the suite runs, in
   `test/test_helper.exs`:
 
-      Ambient.start_servers([Ambient.Clock, Ambient.Random, Ambient.Env, MyApp.Config])
+      Ambient.start_servers([MyApp.Config, Ambient.Clock])
       ExUnit.start()
 
   In production the flag is `false` and the override branches aren't compiled
-  at all: each wrapper *is* the function it wraps – `DateTime.utc_now/0`,
-  `:rand.uniform/1`, `:crypto.strong_rand_bytes/1`, `System.get_env/2`,
-  `Application.get_env/3` – with no lookup and no branch. See
+  at all: each wrapper *is* the function it wraps – `Application.get_env/3`,
+  `DateTime.utc_now/0` – with no lookup and no branch. See
   `Ambient.ProcessOverride` for what that guarantees.
   """
 
@@ -61,7 +59,7 @@ defmodule Ambient do
   Start one override `Server` per given table.
 
   Accepts one value module or a list of them: `Ambient.Clock`,
-  `Ambient.Random`, a module that `use`s `Ambient.Config` or `Ambient.Value`, a
+  `Ambient.Clock`, a module that `use`s `Ambient.Config` or `Ambient.Value`, a
   `use Ambient.Facade` wrapper of one – anything exporting `__ambient_table__/0` –
   or raw table atoms. Idempotent: a table whose server is already running is
   skipped.
@@ -114,6 +112,24 @@ defmodule Ambient do
   def set_private(values) do
     Enum.each(normalize!(values), &ProcessOverride.set_private(table_for(&1)))
   end
+
+  @doc """
+  Report whether a value module's table is process-scoped or globally shared.
+
+  Takes a value module or facade, like `set_shared/2` and `set_private/1` –
+  `Ambient.ProcessOverride.mode/1` is the same query against a raw table atom.
+  Returns `:private` for a table that was never started, so it is safe to call
+  anywhere.
+
+      Ambient.mode(MyApp.Clock)
+      #=> :private
+
+      Ambient.set_shared(MyApp.Clock)
+      Ambient.mode(MyApp.Clock)
+      #=> {:shared, #PID<0.123.0>}
+  """
+  @spec mode(module() | atom()) :: :private | {:shared, pid()}
+  def mode(value), do: ProcessOverride.mode(table_for(value))
 
   # Resolved at compile time, like `Ambient.ProcessOverride`'s own gate – a
   # runtime `if enabled?()` would be dead code the type checker (rightly)
